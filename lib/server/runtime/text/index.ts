@@ -13,3 +13,18 @@ const TEXT: Record<RuntimeId, TextRuntime> = { openai: openaiText, codex: codexT
 export async function generateText(req: TextRequest): Promise<TextReply> {
   return TEXT[runtimeFor("text")].respond(req);
 }
+
+/**
+ * Whether a chat turn shouldn't start for want of credit, as the text runtime counts it: Bops Cloud's
+ * AI credit only when text goes through the cloud (openai, signed in with Orgo); never on codex, whose
+ * plan limit the backend reports itself. An unknown runtime says no here and fails at generateText.
+ */
+export async function textOutOfCredit(): Promise<boolean> {
+  let id: RuntimeId;
+  try {
+    id = runtimeFor("text");
+  } catch {
+    return false;
+  }
+  return TEXT[id].outOfCredit();
+}

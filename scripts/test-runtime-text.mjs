@@ -1,12 +1,14 @@
 // Tests for model runtimes (lib/server/runtime) and the text capability: which runtime runs text
 // (BOPS_RUNTIME, BOPS_TEXT_RUNTIME), text on the user's ChatGPT plan through the Codex backend (the
 // body it accepts, a chat's tool loop sent whole, structured output, a sign-in renewed by Codex and
-// never written by Bops, the plan's usage limit said with when it's back, no sign-in shown as the way
-// in), text on OpenAI as before, and Codex starting on the user's own Codex setup (lib/server/codex.ts).
+// never written by Bops, once for calls at once, the plan's usage limit said with when it's back and
+// held for that account only, a failing stream said plainly, no sign-in shown as the way in), text on
+// OpenAI as before, Bops Cloud's AI credit pausing text only when it goes through the cloud, and Codex
+// starting on the user's own Codex setup with what Bops turns off however it's spelled (lib/server/codex.ts).
 // The Codex backend and OpenAI are fakes on localhost, Codex's home a temporary folder, the state a
 // throwaway file store, and every address outside this machine is closed to the processes Codex
 // starts: nothing reaches the network.
-// Usage: node --conditions=react-server scripts/test-runtime-text.mjs [section]
+// Usage: node --conditions=react-server scripts/test-runtime-text.mjs [codex-config | codex-config-toml | text]
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -96,7 +98,31 @@ if (section("codex-config")) {
   }
 }
 
-if (only && only !== "text") {
+if (section("codex-config-toml")) {
+  if (!haveCodex) console.log("codex-config-toml: no Codex CLI on this machine, skipped");
+  else {
+    // The same servers and plugin spelled every way TOML allows: a single-quoted key, dotted keys under
+    // the parent table, an inline table. Codex starts with each of them off, and with nothing else off.
+    writeFileSync(
+      join(codexHome, "config.toml"),
+      `model = "gpt-6.1-sol"\n\n[plugins.'composio@composio']\nenabled = true\n\n[mcp_servers]\ncua-driver.command = "true"\ncua = { command = "true" }\nnode_repl.command = "true"\n`,
+    );
+    const C = await import(`${root}/lib/server/codex.ts`);
+    // A fresh start of Codex's app server on this config (after any start already under way).
+    await C.codex.ready().catch(() => {});
+    C.codex.proc?.kill();
+    for (let i = 0; i < 200 && C.codex.proc; i++) await new Promise((r) => setTimeout(r, 25));
+    await C.codex.ready();
+    const { config } = await C.codex.request("config/read", { cwd: tmpdir() });
+    assert.equal(config.plugins?.["composio@composio"]?.enabled, false, "Composio off ([plugins.'composio@composio'])");
+    assert.equal(config.mcp_servers?.["cua-driver"]?.enabled, false, "cua-driver off (dotted key under [mcp_servers])");
+    assert.equal(config.mcp_servers?.cua?.enabled, false, "cua off (inline table)");
+    assert.equal(config.mcp_servers?.node_repl?.enabled, true, "the user's other servers stay on");
+    console.log("codex-config-toml -> Composio, cua-driver and cua off; node_repl on");
+  }
+}
+
+if (only === "codex-config" || only === "codex-config-toml") {
   console.log(`all runtime tests passed (${only})`);
   rmSync(scratch, { recursive: true, force: true });
   process.exit(0);
@@ -108,11 +134,13 @@ if (only && only !== "text") {
 const jwt = (claims) => ["{}", JSON.stringify(claims), "sig"].map((p) => Buffer.from(p).toString("base64url")).join(".");
 const authPath = join(codexHome, "auth.json");
 let tokenNo = 0;
+/** The ChatGPT account signIn() signs in to (another one when a test switches accounts). */
+let account = "acct_test";
 /** A new sign-in in auth.json, written as Codex writes it (a new file in place of the old one). Bops never writes it: the file is read-only. */
 function signIn({ expiresIn = 3600, plan = "pro" } = {}) {
-  const token = jwt({ exp: Math.floor(Date.now() / 1000) + expiresIn, "https://api.openai.com/auth": { chatgpt_account_id: "acct_test", chatgpt_plan_type: plan }, n: ++tokenNo });
+  const token = jwt({ exp: Math.floor(Date.now() / 1000) + expiresIn, "https://api.openai.com/auth": { chatgpt_account_id: account, chatgpt_plan_type: plan }, n: ++tokenNo });
   const tmp = `${authPath}.new`;
-  writeFileSync(tmp, JSON.stringify({ auth_mode: "chatgpt", OPENAI_API_KEY: null, tokens: { id_token: "x", access_token: token, refresh_token: "rt-test", account_id: "acct_test" }, last_refresh: new Date().toISOString() }));
+  writeFileSync(tmp, JSON.stringify({ auth_mode: "chatgpt", OPENAI_API_KEY: null, tokens: { id_token: "x", access_token: token, refresh_token: "rt-test", account_id: account }, last_refresh: new Date().toISOString() }));
   chmodSync(tmp, 0o444);
   renameSync(tmp, authPath);
   return token;
@@ -143,7 +171,8 @@ const fake = createServer(async (req, res) => {
     const r = codexAnswer(body);
     if (r.status) return void res.writeHead(r.status, { "content-type": "application/json", ...r.headers }).end(JSON.stringify(r.json ?? {}));
     res.writeHead(200, { "content-type": "text/event-stream" });
-    const events = [
+    // `sse`: the events as given (a failure, an answer cut off); `drop`: the connection breaks mid-answer.
+    const events = r.sse ?? [
       { type: "response.created", response: { id: "resp_c" } },
       ...itemsOf(r).map((item) => ({ type: "response.output_item.done", item })),
       { type: "response.completed", response: { id: `resp_${codexAsked.length}`, model: body.model, usage: { input_tokens: 30, output_tokens: 7 } } },
@@ -153,6 +182,7 @@ const fake = createServer(async (req, res) => {
       const s = `event: ${e.type}\r\ndata: ${JSON.stringify(e)}\r\n\r\n`;
       res.write(s.slice(0, 20));
       await new Promise((d) => setTimeout(d, 2));
+      if (r.drop) return void res.destroy();
       res.write(s.slice(20));
     }
     return void res.end();
@@ -187,6 +217,8 @@ C.codex.request = async (method, params) => {
   if (method !== "account/read") return {};
   renewals.push(params);
   const r = renewal();
+  // Codex takes a moment, so calls that find the token expired at once all wait on this one renewal.
+  await new Promise((d) => setTimeout(d, 30));
   if (params?.refreshToken && r.account) signIn();
   return r;
 };
@@ -359,8 +391,50 @@ signIn();
   const at = Math.floor(Date.now() / 1000) + 600;
   codexAnswer = () => ({ status: 429, headers: { "x-codex-primary-used-percent": "100", "x-codex-primary-reset-at": String(at), "x-codex-secondary-used-percent": "40", "x-codex-secondary-reset-at": String(at + 86400) }, json: {} });
   assert.ok((await send("Again")).includes(new Date(at * 1000).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })), "the reset of the window that's used up");
+  // The limit is that account's: another ChatGPT account signed in to Codex isn't held by it.
+  account = "acct_other";
+  signIn({ plan: "plus" });
+  codexAnswer = () => ({ text: "Fresh plan, fresh limits." });
+  const asked = codexAsked.length;
+  assert.equal(await send("Hi from my other account"), "Fresh plan, fresh limits.");
+  assert.equal(codexAsked.length, asked + 1, "asked on the other account");
+  assert.equal(codexAsked.at(-1).headers["chatgpt-account-id"], "acct_other");
+  // Back on the first account, its limit still stands.
+  account = "acct_test";
+  signIn();
+  assert.match(await send("And now?"), /^I've hit the usage limit on your ChatGPT Pro plan/);
+  assert.equal(codexAsked.length, asked + 1, "the first account still isn't asked");
   globalThis.bopsCodexLimit = undefined;
   console.log("limit ->", said);
+}
+
+/* ---------------- The Codex stream failing, and renewals at once ---------------- */
+
+{
+  const ask = () => text.generateText({ role: "chat", effort: "low", instructions: "Answer.", input: "Hi", usage: { source: "chat" } });
+  const message = { id: "msg_x", type: "message", role: "assistant", content: [{ type: "output_text", text: "Half an ans", annotations: [] }] };
+  codexAnswer = () => ({ sse: [{ type: "response.created", response: {} }, { type: "response.failed", response: { error: { code: "server_error", message: "The model failed" } } }] });
+  await assert.rejects(ask(), { message: "ChatGPT couldn't answer: The model failed" });
+  codexAnswer = () => ({ sse: [{ type: "error", code: "server_error", message: "Overloaded" }] });
+  await assert.rejects(ask(), { message: "ChatGPT couldn't answer: Overloaded" });
+  codexAnswer = () => ({ sse: [{ type: "response.output_item.done", item: message }, { type: "response.incomplete", response: { incomplete_details: { reason: "max_output_tokens" } } }] });
+  await assert.rejects(ask(), { message: "ChatGPT stopped before its answer was done (max_output_tokens)." });
+  codexAnswer = () => ({ sse: [{ type: "response.output_item.done", item: message }] });
+  await assert.rejects(ask(), { message: "ChatGPT's answer was cut off." }, "a stream that ends without response.completed");
+  codexAnswer = () => ({ text: "Never all of it", drop: true });
+  await assert.rejects(ask(), "a connection that breaks mid-answer");
+  // A limit said in the stream counts as the limit.
+  codexAnswer = () => ({ sse: [{ type: "response.failed", response: { error: { code: "usage_limit_reached", message: "limit", resets_in_seconds: 600 } } }] });
+  await assert.rejects(ask(), (e) => e.code === "codex_limit" && /It's back/.test(e.message));
+  globalThis.bopsCodexLimit = undefined;
+  // Two calls that find the sign-in turned down at once: one renewal by Codex, both answered.
+  revoked.add(JSON.parse(readFileSync(authPath, "utf8")).tokens.access_token);
+  const n = renewals.length;
+  codexAnswer = () => ({ text: "Both here." });
+  const both = await Promise.all([ask(), ask(), ask()]);
+  assert.deepEqual(both.map((r) => r.text), ["Both here.", "Both here.", "Both here."]);
+  assert.equal(renewals.length, n + 1, "one renewal for all of them");
+  console.log("stream failures -> said plainly; 3 calls at once, 1 renewal");
 }
 
 /* ---------------- Text on OpenAI, as before ---------------- */
@@ -380,6 +454,34 @@ signIn();
   assert.equal(codexAsked.length, from, "nothing to the Codex backend");
   delete process.env.OPENAI_API_KEY;
   console.log("openai -> previous_response_id tool loop, nothing to Codex");
+}
+
+/* ---------------- Bops Cloud's AI credit counts only when text goes through the cloud ---------------- */
+
+{
+  // Signed in with Orgo (not self-hosting), and Bops Cloud says the AI credit is used up.
+  process.env.BOPS_SELF_HOSTED = "0";
+  process.env.BOPS_CLOUD_URL = `${base}/cloud`;
+  globalThis.bopsOrgoKey = "orgo-test-not-a-real-key";
+  S.update((s) => (s.credits = { out: true, at: Date.now() }));
+  // On the ChatGPT plan, the chat goes on: the cloud's credit isn't what pays for it.
+  process.env.BOPS_TEXT_RUNTIME = "codex";
+  codexAnswer = () => ({ text: "Still here, on your plan." });
+  const from = codexAsked.length;
+  assert.equal(await send("Are you there?"), "Still here, on your plan.");
+  assert.equal(codexAsked.length, from + 1, "the Codex backend was asked");
+  // Text through the cloud (openai): paused as upstream, without asking anyone or replying.
+  process.env.BOPS_TEXT_RUNTIME = "openai";
+  const before = openaiAsked.length;
+  const said = S.getState().messages.filter((m) => m.chatId === chatId && m.role === "bot").length;
+  await chat.handleMessage(chatId, "And through the cloud?");
+  assert.equal(openaiAsked.length, before, "OpenAI (through the cloud) wasn't asked");
+  assert.equal(S.getState().messages.filter((m) => m.chatId === chatId && m.role === "bot").length, said, "no reply while the credit is out");
+  S.update((s) => (s.credits = undefined));
+  globalThis.bopsOrgoKey = null;
+  process.env.BOPS_SELF_HOSTED = "1";
+  delete process.env.BOPS_TEXT_RUNTIME;
+  console.log("cloud credit -> codex text goes on, openai through the cloud pauses");
 }
 
 console.log(`all runtime tests passed (${codexAsked.length} fake Codex calls, ${openaiAsked.length} fake OpenAI calls, none to the network)`);

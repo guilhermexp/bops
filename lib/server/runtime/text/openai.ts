@@ -1,5 +1,6 @@
 import "server-only";
 import type { FunctionTool, ResponseCreateParamsNonStreaming, ResponseInput } from "openai/resources/responses/responses";
+import { creditsOut } from "../../cloud";
 import { openaiClient } from "../../openai-client";
 import { recordTokens } from "../../usage";
 import { modelFor, type TextReply, type TextRequest, type TextRuntime } from "./types";
@@ -34,4 +35,5 @@ async function ask(req: TextRequest, input: TextRequest["input"] | ResponseInput
   };
 }
 
-export const openaiText: TextRuntime = { respond: (req) => ask(req, req.input) };
+// Bops Cloud's AI credit (creditsOut is false unless text goes through the cloud).
+export const openaiText: TextRuntime = { respond: (req) => ask(req, req.input), outOfCredit: creditsOut };

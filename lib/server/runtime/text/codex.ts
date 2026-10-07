@@ -43,4 +43,6 @@ async function ask(req: TextRequest, input: unknown[], session: string): Promise
 
 export const codexText: TextRuntime = {
   respond: (req) => ask(req, typeof req.input === "string" ? [{ role: "user", content: req.input }] : req.input, randomUUID()),
+  // The plan's own limit isn't checked ahead: the backend says so, and codexResponses keeps it until it resets.
+  outOfCredit: async () => false,
 };

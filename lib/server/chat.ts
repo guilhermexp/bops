@@ -2,9 +2,9 @@ import "server-only";
 import { isSecret, learn, memoryBlock, memoryOn, recall, rememberMessage, saveToMemory, wsOf } from "./memory";
 import { APP_TOOLS, findAppActions, runAppAction } from "./composio";
 import { appsNote, placesNote } from "./skills";
-import { generateText, type ToolCall } from "./runtime/text/index";
+import { generateText, textOutOfCredit, type ToolCall } from "./runtime/text/index";
 import { contactLine, createBot } from "./bots";
-import { creditNote, creditsOut, noteOutOfCredit } from "./cloud";
+import { creditNote, noteOutOfCredit } from "./cloud";
 import { noOwnComputer } from "./plan";
 import { botChatId, live, pairChatId, TAPBACK_EMOJI, TAPBACKS, workspaceOf, type Bot, type Message, type Schedule, type Tapback } from "@/lib/types";
 import { computerBriefing, teamBriefing } from "./briefing";
@@ -466,13 +466,14 @@ type TurnOptions = {
 
 /**
  * One bot reads its chat and replies (or just reacts), starting threads, hand-offs and routines as
- * needed. Returns what it said. Nothing while the user's AI credit is used up: the chat shows that,
- * with Upgrade, and the bot says it once when the credit runs out under it (in its chat only).
+ * needed. Returns what it said. Nothing while the user's AI credit is used up and text goes through
+ * Bops Cloud (textOutOfCredit): the chat shows that, with Upgrade, and the bot says it once when the
+ * credit runs out under it (in its chat only). On the ChatGPT plan, Bops Cloud's credit doesn't count.
  */
 async function botTurn(botId: string, chatId: string, opts: TurnOptions = {}): Promise<string | null> {
   const b = bot(botId);
   if (!b) return null;
-  if (await creditsOut()) return null;
+  if (await textOutOfCredit()) return null;
   const owner = ownerName();
   setTyping(chatId, botId, true);
   try {

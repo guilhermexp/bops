@@ -42,7 +42,11 @@ export type TextReply = {
   next(outputs: ToolOutput[]): Promise<TextReply>;
 };
 
-export type TextRuntime = { respond(req: TextRequest): Promise<TextReply> };
+export type TextRuntime = {
+  respond(req: TextRequest): Promise<TextReply>;
+  /** Whether a chat turn shouldn't start for want of credit this runtime's provider bills (Bops Cloud's AI credit, for openai through the cloud). */
+  outOfCredit(): Promise<boolean>;
+};
 
 const DEFAULT_MODEL = "gpt-6.1-sol";
 

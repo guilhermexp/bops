@@ -40,12 +40,15 @@ function limitWords(resetsAt?: number, plan?: string) {
     : `${said} It's back ${at.toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" })} at ${time}.`;
 }
 
-/** The limit last reached, until it resets: calls fail at once meanwhile, as a bot out of credit doesn't ask. */
-const g = globalThis as unknown as { bopsCodexLimit?: { until: number; resetsAt?: number; plan?: string } };
+/**
+ * The limit last reached, for the account that reached it, until it resets: that account's calls fail
+ * at once meanwhile, as a bot out of credit doesn't ask. Another account signed in to Codex isn't held by it.
+ */
+const g = globalThis as unknown as { bopsCodexLimit?: { accountId: string; until: number; resetsAt?: number; plan?: string } };
 
-function reached(resetsAt: number | undefined, plan: string | undefined) {
-  g.bopsCodexLimit = { until: resetsAt ?? Date.now() + UNKNOWN_RESET_MS, resetsAt, plan };
-  return new CodexLimitError(resetsAt, plan);
+function reached(resetsAt: number | undefined, auth: CodexAuth) {
+  g.bopsCodexLimit = { accountId: auth.accountId, until: resetsAt ?? Date.now() + UNKNOWN_RESET_MS, resetsAt, plan: auth.plan };
+  return new CodexLimitError(resetsAt, auth.plan);
 }
 
 type Problem = { type?: string; code?: string; message?: string; resets_at?: number; resets_in_seconds?: number };
@@ -68,7 +71,7 @@ function resetOf(p: Problem | undefined, headers: Headers): number | undefined {
 /** An error ChatGPT answered with, as Bops says it. */
 function failure(p: Problem | undefined, status: number, headers: Headers, auth: CodexAuth): Error {
   const kind = p?.type ?? p?.code;
-  if (kind === "usage_limit_reached" || kind === "rate_limit_exceeded" || status === 429) return reached(resetOf(p, headers), auth.plan);
+  if (kind === "usage_limit_reached" || kind === "rate_limit_exceeded" || status === 429) return reached(resetOf(p, headers), auth);
   if (status === 401) return new CodexSignInError("ChatGPT didn't accept your Codex sign-in. Sign in again from Settings → This Mac (Computer use on your Mac → Sign in).");
   if (kind === "usage_not_included") return new Error("Your ChatGPT plan doesn't include Codex, which Bops runs on. Set BOPS_RUNTIME=openai to use an OpenAI key instead.");
   return new Error(`ChatGPT couldn't answer${status ? ` (${status})` : ""}${p?.message ? `: ${p.message}` : "."}`);
@@ -83,9 +86,9 @@ export type CodexAnswer = { items: CodexItem[]; model?: string; usage?: { input_
  * `session` keeps a conversation's requests together (ChatGPT caches its prompt by it).
  */
 export async function codexResponses(body: Record<string, unknown>, session: string): Promise<CodexAnswer> {
-  const standing = g.bopsCodexLimit;
-  if (standing && Date.now() < standing.until) throw new CodexLimitError(standing.resetsAt, standing.plan);
   let auth = await codexAuth();
+  const standing = g.bopsCodexLimit;
+  if (standing?.accountId === auth.accountId && Date.now() < standing.until) throw new CodexLimitError(standing.resetsAt, standing.plan);
   let res = await post(body, auth, session);
   if (res.status === 401) {
     await res.body?.cancel();
