@@ -1,0 +1,10 @@
+{
+  "version": "0.18.0",
+  "hosts": [
+    "claude",
+    "cursor",
+    "agents"
+  ],
+  "tier": 1,
+  "cache_dir": "graft"
+}

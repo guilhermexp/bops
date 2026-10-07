@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "graft": {
+      "command": "/Users/guilhermevarela/orchestrator/scripts/project-graft.sh",
+      "args": [
+        "mcp",
+        "--target-env",
+        "CLAUDE_PROJECT_DIR"
+      ],
+      "env": {
+        "DO_NOT_TRACK": "1"
+      }
+    }
+  }
+}

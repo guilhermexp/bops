@@ -54,3 +54,8 @@ next-env.d.ts
 # Bops Cloud installs its two dependencies here on its box
 /cloud/node_modules
 .scratch/
+
+# Harness verification evidence and scratch
+/.tmp/
+
+/graft/

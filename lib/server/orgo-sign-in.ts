@@ -225,8 +225,8 @@ async function profile(apiKey: string): Promise<OrgoUser | null> {
 }
 
 /**
- * Whether the app has to ask the user to sign in: not when they are, and not for a self-hoster
- * who runs on their own key (BOPS_SELF_HOSTED=1 with ORGO_API_KEY).
+ * Whether the app has to ask the user to sign in: not when they are, and never for a self-hoster
+ * (BOPS_SELF_HOSTED=1), who runs on their own keys, with or without ORGO_API_KEY.
  */
 export async function authStatus() {
   const key = await loadOrgoKey();
@@ -252,6 +252,6 @@ export async function authStatus() {
   // Signed in per the state, but the Keychain wouldn't give the key (locked, or a prompt turned down):
   // the app opens, and its account page says so (instead of a sign-in that mints yet another key).
   const keyUnreadable = !key && !!signedInUser();
-  const selfHostedKey = process.env.BOPS_SELF_HOSTED === "1" && !!process.env.ORGO_API_KEY;
-  return { signedIn, user: signedIn || keyUnreadable ? signedInUser() : null, needsSignIn: !signedIn && !keyUnreadable && !selfHostedKey };
+  const selfHosted = process.env.BOPS_SELF_HOSTED === "1";
+  return { signedIn, user: signedIn || keyUnreadable ? signedInUser() : null, needsSignIn: !signedIn && !keyUnreadable && !selfHosted };
 }

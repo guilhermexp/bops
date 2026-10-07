@@ -1,0 +1,23 @@
+---
+name: graft
+description: This repo is indexed by graft/. For ANY task here, whether
+  understanding how something works, finding where code lives, tracing what
+  calls a symbol or what a change breaks, or scoping an edit, get your context
+  from graft before grepping or reading source files.
+---
+
+# graft
+
+## Graft — Grafo de Código Estático
+
+> **Diretiva de Especificação, Governança e Grafo de Código:**
+> 1. Antes de construir ou editar código, consulte sempre as especificações OpenSpec (`openspec/`) e a documentação DOX (`AGENTS.md`) locais deste projeto como fontes autoritativas de requisitos.
+> 2. O Graft indexa estritamente código-fonte (AST/símbolos), e não arquivos Markdown.
+> 3. Para consultas ao grafo deste projeto, utilize exclusivamente o utilitário do harness com raiz obrigatória explícita do checkout atual sob trabalho e telemetria desativada:
+>    - Quem chama um símbolo: /Users/guilhermevarela/orchestrator/scripts/project-graft.sh query callers <target-absoluto> <simbolo> [--depth N]
+>    - Assinaturas de um arquivo: /Users/guilhermevarela/orchestrator/scripts/project-graft.sh query skeleton <target-absoluto> <arquivo>
+>    - Busca semântica estrutural: /Users/guilhermevarela/orchestrator/scripts/project-graft.sh query ask <target-absoluto> "<pergunta>" [--source]
+>    - Mapa de orientação do repositório: /Users/guilhermevarela/orchestrator/scripts/project-graft.sh query map <target-absoluto>
+>    - Reconciliação / Verificação: /Users/guilhermevarela/orchestrator/scripts/project-graft.sh check <target-absoluto> [--json]
+>    - Rebuild do cache: /Users/guilhermevarela/orchestrator/scripts/project-graft.sh ensure <target-absoluto>
+>    (Onde `<target-absoluto>` deve ser substituído pela raiz absoluta do checkout atual sob trabalho, obtida do brief ou contexto de execução).
