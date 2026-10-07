@@ -14,7 +14,7 @@ type Problem = { message?: string; code?: string | number; codexErrorInfo?: stri
 function failure(error: Problem, auth: CodexAuth): Error {
   const info = JSON.stringify(error.codexErrorInfo ?? error.code ?? "");
   const message = error.message ?? "Codex couldn't finish";
-  if (/usage_limit_reached|rate_limit_exceeded|usageLimitExceeded|usage limit|rate limit/i.test(`${info} ${message}`)) {
+  if (error.codexErrorInfo === "rateLimitExceeded" || /usage_limit_reached|rate_limit_exceeded|usageLimitExceeded|usage limit|rate limit/i.test(`${info} ${message}`)) {
     const reset = error.resets_at ? error.resets_at * 1000 : error.resets_in_seconds ? Date.now() + error.resets_in_seconds * 1000 : undefined;
     return new CodexLimitError(reset, auth.plan);
   }
@@ -31,6 +31,9 @@ async function settings(req: TaskOpen) {
   ]);
   const personalSkills = listed.data?.flatMap((entry) => entry.skills).filter((skill) => !req.native || !skill.pluginId?.includes("computer-use")) ?? [];
   const isolated = req.native ? {} : {
+    sandbox_workspace_write: {
+      writable_roots: [], network_access: false, exclude_slash_tmp: true, exclude_tmpdir_env_var: true,
+    },
     mcp_servers: Object.fromEntries(Object.keys(read.config?.mcp_servers ?? {}).map((name) => [name, { enabled: false }])),
     plugins: Object.fromEntries(Object.keys(read.config?.plugins ?? {}).map((name) => [name, { enabled: false }])),
   };
@@ -98,7 +101,10 @@ function turn({ thread, input, effort, botId, epoch, hooks }: TaskTurn): Promise
       hooks.turnId?.(undefined);
       if (usage && !countedTotal) recordTokens("session", model, { input_tokens: usage.inputTokens, output_tokens: usage.outputTokens }, botId, epoch);
       if (error) reject(error);
-      else resolve(last || "Done.");
+      else {
+        if (native) hooks.removeLastNote?.(last);
+        resolve(last || "Done.");
+      }
     };
     const interrupt = () => {
       stopRequested = true;
@@ -145,7 +151,7 @@ function turn({ thread, input, effort, botId, epoch, hooks }: TaskTurn): Promise
         if (item.type === "agentMessage" && m.method === "item/completed") {
           if (item.text) {
             last = item.text;
-            if (item.phase === "commentary" && !seen.has(key)) {
+            if ((item.phase === "commentary" || native && item.phase == null) && !seen.has(key)) {
               hooks.step("note", item.text);
               if (!summaries.size) hooks.caption(item.text.replace(/\*\*/g, "").trim().slice(0, 60));
             }

@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { spawn, spawnSync } from "node:child_process";
 import { registerHooks, stripTypeScriptTypes } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +16,7 @@ import { pathToFileURL } from "node:url";
 
 for (const k of ["BOPS_DATABASE_URL", "ORGO_API_KEY", "OPENAI_API_KEY", "OPENAI_EXECUTOR_API_KEY", "BOPS_RUNTIME", "BOPS_TEXT_RUNTIME", "BOPS_TASK_RUNTIME", "BOPS_VOICE_RUNTIME", "BOPS_SESSION_MODEL", "BOPS_HARD_MODEL", "BOPS_CHAT_MODEL", "BOPS_CODEX_BASE_URL"])
   delete process.env[k];
+const realCodexBin = spawnSync("which", ["codex"], { encoding: "utf8" }).stdout?.trim();
 const scratch = mkdtempSync(join(tmpdir(), "bops-test-runtime-tasks-"));
 const codexHome = join(scratch, "codex-home");
 const bin = join(scratch, "bin");
@@ -61,7 +63,7 @@ globalThis.__bopsTestCodex = {
   ready: async () => {},
   request: async (method, params) => {
     calls.push({ method, params: JSON.parse(JSON.stringify(params ?? {})) });
-    if (method === "config/read") return { config: { mcp_servers: { personal_browser: { command: "false" } }, plugins: { "other@test": { enabled: true } } } };
+    if (method === "config/read") return { config: { sandbox_workspace_write: { writable_roots: [scratch], network_access: true, exclude_slash_tmp: false, exclude_tmpdir_env_var: false }, mcp_servers: { personal_browser: { command: "false" } }, plugins: { "other@test": { enabled: true } } } };
     if (method === "skills/list") return { data: [{ skills: [{ path: "/tmp/private-skill/SKILL.md", pluginId: null }, { path: "/tmp/computer-use/SKILL.md", pluginId: "unified-computer-use@openai-bundled" }] }] };
     if (method === "thread/start") return { thread: { id: "thr_1" } };
     if (method === "thread/resume") return { thread: { id: params.threadId } };
@@ -246,6 +248,158 @@ const orgoPlace = { host: "orgo", computerId: "comp_test", display: 100, session
 const macOpen = (extra = {}) => ({ instructions, effort: "medium", place: macPlace, botId: "boppy", ...extra });
 const tick = () => new Promise((r) => setImmediate(r));
 const of = (method) => calls.filter((c) => c.method === method);
+
+// Exercise the real parser and tool filter without model turns or network access. The fake MCP
+// advertises an unsafe tool but has no call handler, so this test never executes host code.
+async function actualCodexSafety(params) {
+  if (!realCodexBin) { console.log("review CLI safety -> skipped (Codex CLI not installed)"); return; }
+  const home = mkdtempSync(join(scratch, "review-codex-"));
+  const outside = join(home, "outside-workspace");
+  mkdirSync(outside);
+  writeFileSync(join(home, "config.toml"), `[sandbox_workspace_write]\nwritable_roots = [${JSON.stringify(outside)}]\nnetwork_access = true\nexclude_slash_tmp = false\nexclude_tmpdir_env_var = false\n`);
+  const mcpPath = join(home, "fake-mcp.mjs");
+  const sdk = `${root}/node_modules/@modelcontextprotocol/sdk`;
+  writeFileSync(mcpPath, `import { Server } from ${JSON.stringify(sdk + "/dist/esm/server/index.js")};
+import { StdioServerTransport } from ${JSON.stringify(sdk + "/dist/esm/server/stdio.js")};
+import { ListToolsRequestSchema } from ${JSON.stringify(sdk + "/dist/esm/types.js")};
+const server = new Server({name:"bops-review-fake",version:"1"},{capabilities:{tools:{}}});
+server.setRequestHandler(ListToolsRequestSchema,async()=>({tools:["browser_snapshot","browser_run_code_unsafe"].map(name=>({name,description:name,inputSchema:{type:"object",properties:{}}}))}));
+await server.connect(new StdioServerTransport());`);
+  const proc = spawn(realCodexBin, ["app-server"], { cwd: workspace, detached: true, stdio: ["pipe", "pipe", "ignore"], env: {
+    PATH: process.env.PATH, CODEX_HOME: home, TMPDIR: home,
+    HTTP_PROXY: "http://127.0.0.1:9", HTTPS_PROXY: "http://127.0.0.1:9", ALL_PROXY: "http://127.0.0.1:9", NO_PROXY: "127.0.0.1,localhost",
+    CODEX_DISABLE_AUTOUPDATER: "1", CODEX_DISABLE_SENTRY: "1",
+  } });
+  let buffer = "", next = 1;
+  const waiting = new Map();
+  const send = (m) => proc.stdin.write(JSON.stringify(m) + "\n");
+  const request = (method, params) => new Promise((resolve, reject) => {
+    const id = next++;
+    const timer = setTimeout(() => { waiting.delete(id); reject(new Error(`CLI safety timeout: ${method}`)); }, 20000);
+    waiting.set(id, (m) => { clearTimeout(timer); m.error ? reject(new Error(m.error.message)) : resolve(m.result); });
+    send({ jsonrpc: "2.0", id, method, params });
+  });
+  proc.stdout.setEncoding("utf8");
+  proc.stdout.on("data", (chunk) => {
+    buffer += chunk;
+    let end;
+    while ((end = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
+      if (!line.trim()) continue;
+      const m = JSON.parse(line); const done = waiting.get(m.id);
+      if (done) { waiting.delete(m.id); done(m); }
+    }
+  });
+  let threadId;
+  try {
+    await request("initialize", { clientInfo: { name: "bops-task-safety-test", version: "1" }, capabilities: {} });
+    send({ jsonrpc: "2.0", method: "initialized", params: {} });
+    const read = await request("config/read", { cwd: workspace });
+    assert.equal(read.config.sandbox_workspace_write.network_access, true, "fixture loaded broad temporary user config");
+    assert.deepEqual(read.config.sandbox_workspace_write.writable_roots, [outside]);
+    const threadParams = { ...params, config: { ...params.config, plugins: {}, mcp_servers: {
+      browser: { ...params.config.mcp_servers.browser, command: process.execPath, args: [mcpPath], cwd: workspace },
+    } } };
+    const started = await request("thread/start", threadParams);
+    threadId = started.thread.id;
+    const inventory = await request("mcpServerStatus/list", { threadId, serverName: "browser", detail: "full" });
+    const browser = inventory.data.find((s) => s.name === "browser");
+    assert.equal(browser.runtimeStatus, "connected"); assert.equal(browser.toolsError, null);
+    return { sandbox: started.sandbox, tools: Object.keys(browser.tools) };
+  } finally {
+    if (threadId) await request("thread/unsubscribe", { threadId }).catch(() => {});
+    const exited = proc.exitCode !== null ? Promise.resolve() : new Promise((r) => proc.once("exit", r));
+    if (proc.pid) try { process.kill(-proc.pid, "SIGTERM"); } catch {}
+    await exited;
+  }
+}
+
+// Regressions from independent tasks review; focused modes preserve RED/GREEN evidence.
+const reviewRegressions = {
+  async "review-allowlist"() {
+    const rt = tasks.macTasksRuntime();
+    const thread = await rt.open(macOpen());
+    try {
+      const params = of("thread/start").at(-1).params;
+      const browser = params.config.mcp_servers.browser;
+      assert.ok(Array.isArray(browser.enabled_tools), "bot browser must expose an explicit tool allowlist, not the unsafe core set");
+      assert.ok(browser.enabled_tools.includes("browser_navigate"));
+      assert.ok(browser.enabled_tools.includes("browser_snapshot"));
+      assert.ok(browser.enabled_tools.includes("browser_take_screenshot"), "visual browser tasks must retain safe screenshots");
+      assert.equal(browser.enabled_tools.includes("browser_run_code_unsafe"), false, "host JavaScript must not be exposed or auto-approved");
+      assert.equal(browser.enabled_tools.includes("browser_install"), false);
+      assert.equal(browser.enabled_tools.includes("browser_file_upload"), false);
+      const effective = await actualCodexSafety(params);
+      if (effective) {
+        assert.ok(effective.tools.includes("browser_snapshot"));
+        assert.equal(effective.tools.includes("browser_run_code_unsafe"), false, "real Codex filters the unsafe tool before exposure");
+      }
+      console.log("review-allowlist -> browser navigation available; host code not exposed/approved");
+    } finally { await rt.close(thread); }
+  },
+  async "review-sandbox"() {
+    const rt = tasks.macTasksRuntime();
+    for (const resume of [undefined, { id: "thr_saved" }]) {
+      const thread = await rt.open(macOpen({ resume }));
+      try {
+        const params = of(resume ? "thread/resume" : "thread/start").at(-1).params;
+        assert.deepEqual(params.config.sandbox_workspace_write, { writable_roots: [], network_access: false, exclude_slash_tmp: true, exclude_tmpdir_env_var: true }, "bot thread must reset broad inherited roots/network/tmp permissions");
+        if (!resume) {
+          const effective = await actualCodexSafety(params);
+          if (effective) {
+            const narrow = { type: "workspaceWrite", writableRoots: [], networkAccess: false, excludeSlashTmp: true, excludeTmpdirEnvVar: true };
+            assert.deepEqual(effective.sandbox, narrow, "real parser must not inherit broad temporary user policy");
+          }
+        }
+      } finally { await rt.close(thread); }
+    }
+    const native = await rt.open(macOpen({ native: true }));
+    assert.equal(of("thread/start").at(-1).params.config.sandbox_workspace_write, undefined, "native app approvals retain their policy");
+    await rt.close(native);
+    console.log("review-sandbox -> broad owner permissions reset on start/resume; native unchanged");
+  },
+  async "review-limit"() {
+    const rt = tasks.macTasksRuntime();
+    const thread = await rt.open(macOpen());
+    try {
+      const pending = rt.turn({ thread, input: "Read the page", effort: "medium", botId: "boppy", epoch: store.stateEpoch(), hooks: { step() {}, caption() {}, isStopped: () => false, bindStop() {} } });
+      const result = pending.catch((e) => e);
+      await tick();
+      emit(thread.id, "turn/completed", { turn: { status: "failed", error: { codexErrorInfo: "rateLimitExceeded", message: "Request could not be completed", resets_in_seconds: 60 } } });
+      const error = await result;
+      assert.ok(error instanceof CodexLimitError, `structured rateLimitExceeded must use the plan-limit path; got ${error.constructor.name}: ${error.message}`);
+      assert.equal(cloud.noteOutOfCredit(error), true);
+      assert.match(cloud.creditNote(error), /ChatGPT Pro plan/);
+      assert.equal(store.getState().credits, undefined);
+      console.log("review-limit -> structured rateLimitExceeded uses plan-limit handling");
+    } finally { await rt.close(thread); }
+  },
+  async "review-phase"() {
+    const rt = tasks.macTasksRuntime();
+    const thread = await rt.open(macOpen({ native: true }));
+    const steps = [], captions = [];
+    try {
+      const pending = rt.turn({ thread, input: "Use Calculator", effort: "medium", botId: "boppy", epoch: store.stateEpoch(), hooks: {
+        step: (tool, detail) => steps.push({ tool, detail }), caption: (text) => captions.push(text), isStopped: () => false, bindStop() {},
+        removeLastNote: (text) => { if (steps.at(-1)?.tool === "note" && steps.at(-1).detail === text) steps.pop(); },
+      } });
+      await tick();
+      emit(thread.id, "item/completed", { item: { id: "narration", type: "agentMessage", text: "Opening Calculator now" } });
+      assert.deepEqual(steps, [{ tool: "note", detail: "Opening Calculator now" }], "native intermediate message without phase must appear live as a step");
+      assert.equal(captions.at(-1), "Opening Calculator now", "native narration must be a live caption");
+      emit(thread.id, "item/started", { item: { id: "calculation", type: "mcpToolCall", server: "cua_repl", tool: "js", arguments: { title: "Calculate 7 times 8" } } });
+      emit(thread.id, "item/completed", { item: { id: "final", type: "agentMessage", text: "56" } });
+      emit(thread.id, "turn/completed", { turn: { status: "completed" } });
+      assert.equal(await pending, "56");
+      assert.deepEqual(steps, [{ tool: "note", detail: "Opening Calculator now" }, { tool: "computer", detail: "Calculate 7 times 8" }], "only the final answer note is removed");
+      console.log("review-phase -> native missing-phase narration is live; final answer removed from notes");
+    } finally { await rt.close(thread); }
+  },
+};
+if (reviewRegressions[process.argv[2]]) {
+  await reviewRegressions[process.argv[2]]();
+  fake.close(); rmSync(scratch, { recursive: true, force: true }); process.exit(0);
+}
 
 /* ---------------- Which runtime runs tasks ---------------- */
 
@@ -564,6 +718,8 @@ for (const completesEarly of [false, true]) {
   await rt.close(thread);
 }
 console.log("stop race -> queued interrupt delivered after a late turn id, no stale listener");
+
+for (const regression of Object.values(reviewRegressions)) await regression();
 
 console.log("all runtime task tests passed (fake app-server, fake Agents API, none to the network)");
 fake.close();

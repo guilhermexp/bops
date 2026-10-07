@@ -97,7 +97,19 @@ export const browserMcp = (port: number) => {
 /** App-server's stdio MCP config for the same bot browser. */
 export function browserServer(port: number, workspace: string) {
   const { command, args } = browserMcp(port);
-  return { command, args, cwd: workspace, tool_timeout_sec: 120, required: true, default_tools_approval_mode: "approve" };
+  // This MCP runs outside the command sandbox. Expose browser interactions only, never the
+  // core set's host-code runner, installers or file uploads; new tools stay unavailable.
+  return {
+    command, args: [...args, "--output-dir", workspace], cwd: workspace,
+    tool_timeout_sec: 120, required: true, default_tools_approval_mode: "approve",
+    enabled_tools: [
+      "browser_navigate", "browser_navigate_back", "browser_navigate_forward", "browser_snapshot",
+      "browser_click", "browser_drag", "browser_hover", "browser_type", "browser_press_key",
+      "browser_select_option", "browser_fill_form", "browser_handle_dialog", "browser_tabs",
+      "browser_wait_for", "browser_close", "browser_evaluate", "browser_take_screenshot",
+      "browser_resize", "browser_console_messages", "browser_network_requests",
+    ],
+  };
 }
 
 /** Start `codex exec-server` for one session; it dials out to OpenAI and runs the agent's tools here. */

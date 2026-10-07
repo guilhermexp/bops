@@ -17,6 +17,7 @@ export type TaskOpen = {
 };
 export type TaskHooks = {
   step(tool: string, detail: string, by?: { who?: string; screen?: number }): void;
+  removeLastNote?(text: string): void;
   caption(text: string): void;
   isStopped(): boolean;
   bindStop(stop: () => void): void;

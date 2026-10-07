@@ -1046,6 +1046,10 @@ async function runMac(sessionId: string) {
 function taskHooks(sessionId: string): TaskHooks {
   return {
     step: (tool, detail, by) => step(sessionId, tool, detail, by),
+    removeLastNote: (text) => patchSession(sessionId, (x) => {
+      const last = x.steps.at(-1);
+      if (last?.tool === "note" && last.detail === text) x.steps.pop();
+    }),
     caption: (activity) => patchSession(sessionId, { activity }),
     isStopped: () => stopped.has(sessionId),
     bindStop: (stop) => interrupts.set(sessionId, stop),
