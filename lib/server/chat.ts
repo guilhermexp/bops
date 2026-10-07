@@ -30,8 +30,8 @@ import { isCodexSignIn } from "./runtime/codex/auth";
  * each bot speaks for itself. Bots can tapback instead of replying, and inline replies stay together.
  */
 
-/** Texting should feel instant: chat turns mostly reply and route, so they think lightly. Threads think harder. */
-const CHAT_EFFORT = (process.env.BOPS_CHAT_EFFORT ?? "low") as "low" | "medium" | "high";
+/** Texting should feel instant: chat turns mostly reply and route, so they think lightly. Threads think harder. Empty (as in .env.example) is unset. */
+const CHAT_EFFORT = (process.env.BOPS_CHAT_EFFORT?.trim() || "low") as "low" | "medium" | "high";
 
 const SCHEDULE_PARAMS = {
   type: "object",

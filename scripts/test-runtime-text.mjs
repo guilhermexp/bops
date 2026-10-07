@@ -23,6 +23,9 @@ mkdirSync(codexHome, { recursive: true });
 Object.assign(process.env, {
   BOPS_SELF_HOSTED: "1",
   CODEX_HOME: codexHome,
+  // Left empty, as a copy of .env.example has them: the defaults apply.
+  BOPS_CHAT_MODEL: "",
+  BOPS_CHAT_EFFORT: "",
   // Codex itself (the app server Bops starts) can't reach anything but this machine.
   HTTPS_PROXY: "http://127.0.0.1:9",
   HTTP_PROXY: "http://127.0.0.1:9",
