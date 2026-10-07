@@ -20,11 +20,25 @@ function emit(call: Call, event: VoiceEvent) {
 function finish(call: Call) {
   if (call.closed) return;
   call.closed = true;
+  call.socket.removeAllListeners("message");
+  if (call.socket.readyState === WebSocket.OPEN) call.socket.close();
+  else if (call.socket.readyState === WebSocket.CONNECTING) call.socket.terminate();
   emit(call, { kind: "closed" });
   clearTimeout(call.expiry);
   call.expiry = setTimeout(() => {
     for (const [id, value] of calls) if (value === call) calls.delete(id);
   }, 60_000);
+  call.expiry.unref?.();
+}
+
+// Only inactivity expires a live call; terminal captions have a separate retention timer.
+function renewIdle(call: Call) {
+  if (call.closed) return;
+  clearTimeout(call.expiry);
+  call.expiry = setTimeout(() => {
+    if (call.socket.readyState === WebSocket.OPEN) call.socket.send(JSON.stringify({ type: "session.close" }));
+    finish(call);
+  }, 60 * 60_000);
   call.expiry.unref?.();
 }
 
@@ -120,9 +134,7 @@ async function open(callId: string, auth: CodexAuth, session: string, realtime: 
   socket.on("error", () => { if (!call.closed) { emit(call, { kind: "error", message: "ChatGPT's voice connection stopped. Please call again." }); finish(call); } });
   await new Promise<void>((resolve, reject) => { socket.once("open", resolve); socket.once("error", () => reject(new Error("ChatGPT's voice sideband couldn't connect."))); socket.once("close", () => reject(new Error("ChatGPT's voice sideband closed before connecting."))); });
   calls.set(callId, call);
-  // An abandoned page cannot leave a paid session open forever.
-  call.expiry = setTimeout(() => { if (!call.closed) { socket.send(JSON.stringify({ type: "session.close" })); socket.close(); finish(call); } }, 60 * 60_000);
-  call.expiry.unref?.();
+  renewIdle(call);
   return call;
 }
 
@@ -148,6 +160,7 @@ export const codexVoiceRuntime: VoiceRuntime = {
     const call = calls.get(callId);
     if (!call || call.closed || call.socket.readyState !== WebSocket.OPEN) throw new Error("This voice call has ended.");
     for (const chunk of chunks(text)) call.socket.send(JSON.stringify({ type: delegationId ? "delegation.context.append" : "session.context.append", ...(delegationId ? { delegation_item_id: delegationId } : {}), ...(complete ? {} : { channel: "commentary" }), content: [{ type: "input_text", text: chunk }] }));
+    renewIdle(call);
   },
   async close(callId) {
     const call = calls.get(callId);
@@ -158,6 +171,7 @@ export const codexVoiceRuntime: VoiceRuntime = {
   },
   events(callId, after) {
     const call = calls.get(callId);
+    if (call) renewIdle(call);
     return call ? { events: call.events.slice(Math.max(0, after - call.base)), cursor: call.base + call.events.length } : null;
   },
 };

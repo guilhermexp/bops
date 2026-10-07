@@ -8,6 +8,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, st
 import { createServer } from "node:http";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
+import { mock } from "node:test";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { WebSocketServer } from "ws";
@@ -135,12 +136,13 @@ globalThis.fetch = (input, init) => {
   return realFetch(input, init);
 };
 
-const until = async (pred, label) => {
+const realTimeout = globalThis.setTimeout;
+const until = async (pred, label, failure = () => assert.fail(label)) => {
   for (let i = 0; i < 100; i++) {
     if (await pred()) return;
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => realTimeout(r, 20));
   }
-  assert.fail(label);
+  failure();
 };
 
 const S = await import(`${root}/lib/server/store.ts`);
@@ -171,6 +173,61 @@ const eventsOf = async (callId, after) => {
   assert.equal(res.status, 200, await res.clone().text());
   return res.json();
 };
+
+// Exercise the public runtime against a real localhost WebSocket, with virtual idle time.
+async function lifecycle(which) {
+  const { codexVoiceRuntime: runtime } = await import(`${root}/lib/server/runtime/voice/codex.ts`);
+  delete process.env.BOPS_VOICE_RUNTIME;
+  signalingAnswer = () => ({ status: 201, sdp: ANSWER, callId: `rtc_${signaling.length}` });
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const res = await post({ action: "start", botId: boppy.id, sdp: OFFER });
+    const json = await res.json();
+    assert.equal(res.status, 201, json.error ?? "");
+    const callId = json.client.callId;
+    const band = sidebandSockets.at(-1);
+    if (which === "session-closed") {
+      // The provider closes the session, deliberately leaving its WebSocket open.
+      band.ws.send(JSON.stringify({ type: "session.closed" }));
+      await until(() => runtime.events(callId, 0)?.events.some((e) => e.kind === "closed"), "provider close reaches polling");
+      await until(() => band.ws.readyState === 3, "session.closed must close the still-open sideband socket", () => assert.equal(band.ws.readyState, 3, "session.closed must close the still-open sideband socket"));
+      assert.equal((await post({ action: "close", callId })).status, 200, "browser cleanup after provider close is idempotent");
+      assert.equal(runtime.events(callId, 0).events.filter((e) => e.kind === "closed").length, 1);
+      console.log("lifecycle session.closed -> sideband closed, browser cleanup idempotent");
+    } else {
+      const hour = 60 * 60_000;
+      mock.timers.tick(hour - 1);
+      assert.ok(runtime.events(callId, 0), "successful polling keeps the call active");
+      mock.timers.tick(2);
+      await new Promise((r) => realTimeout(r, 30));
+      assert.equal(band.ws.readyState, 1, "active polling call must survive its original one-hour deadline");
+      await runtime.say(callId, "Still here.");
+      await until(() => sidebandGot.some((e) => e.content?.[0]?.text === "Still here."), "successful control reaches the sideband");
+      mock.timers.tick(hour - 1);
+      await new Promise((r) => realTimeout(r, 30));
+      assert.equal(band.ws.readyState, 1, "successful control must renew the inactivity deadline too");
+      mock.timers.tick(1);
+      await until(() => band.ws.readyState === 3, "one hour without polling or control closes the abandoned sideband");
+      assert.ok(runtime.events(callId, 0).events.some((e) => e.kind === "closed"));
+      await assert.rejects(runtime.say(callId, "Too late."), /This voice call has ended/);
+      console.log("lifecycle idle -> polling and control renew; abandoned call expires after one idle hour");
+    }
+    // Polling a terminal record cannot prolong its retention or rearm an idle timer.
+    mock.timers.tick(60_000);
+    assert.equal(runtime.events(callId, 0), null, "closed call is removed after the caption buffer expires");
+  } finally {
+    mock.timers.reset();
+  }
+}
+
+const focusedLifecycle = process.argv[2];
+if (focusedLifecycle) {
+  assert.ok(["session-closed", "idle"].includes(focusedLifecycle));
+  await lifecycle(focusedLifecycle);
+  fake.close();
+  rmSync(scratch, { recursive: true, force: true });
+  process.exit(0);
+}
 
 /* ---------------- A call on the plan: SDP in, SDP out, the token stays on the server ---------------- */
 
@@ -437,6 +494,9 @@ const eventsOf = async (callId, after) => {
   assert.equal(livePosts.length, liveBefore, "that answer does not create a live session");
   console.log("sip -> refused on codex voice, still the OpenAI route when voice is openai");
 }
+
+await lifecycle("session-closed");
+await lifecycle("idle");
 
 console.log("all runtime voice tests passed");
 fake.close();
