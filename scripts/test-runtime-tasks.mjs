@@ -2,7 +2,8 @@
 // app-server (Mac Chrome via Playwright MCP, live web search, workspace commands, reasoning captions,
 // steps, a later reply on the same thread, stop, resume, tokens), a cloud computer refused with the
 // runtime to use, and the OpenAI Agents API path unchanged. The app-server is the codex singleton
-// stubbed here; the Agents API is a fake on localhost; Codex's home and the Mac workspace are a
+// stubbed for task turns; safety checks also use the real CLI parser/tool filter without model
+// turns. The Agents API is a fake on localhost; Codex's home and the Mac workspace are a
 // temporary folder. Nothing reaches the network.
 // Usage: node --conditions=react-server scripts/test-runtime-tasks.mjs
 import assert from "node:assert/strict";
@@ -276,7 +277,7 @@ await server.connect(new StdioServerTransport());`);
   const request = (method, params) => new Promise((resolve, reject) => {
     const id = next++;
     const timer = setTimeout(() => { waiting.delete(id); reject(new Error(`CLI safety timeout: ${method}`)); }, 20000);
-    waiting.set(id, (m) => { clearTimeout(timer); m.error ? reject(new Error(m.error.message)) : resolve(m.result); });
+    waiting.set(id, (m) => { clearTimeout(timer); if (m.error) reject(new Error(m.error.message)); else resolve(m.result); });
     send({ jsonrpc: "2.0", id, method, params });
   });
   proc.stdout.setEncoding("utf8");

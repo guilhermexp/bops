@@ -56,7 +56,7 @@ node --conditions=react-server scripts/test-runtime-tasks.mjs               # se
 node --conditions=react-server scripts/test-phone-voice.mjs                # phone turns on openai (bodies) and on codex
 ```
 
-Fakes only: Codex backend and OpenAI on localhost, `CODEX_HOME` in a temp dir with a made-up JWT, Codex's renewal stubbed on the `codex` object; the Codex app server it starts gets a dead proxy. Tasks use the same temporary state/workspace with the `codex` singleton stubbed and Agents API on localhost; Chrome, memory, routing decisions and notifications are stubbed. Against the real backend: the root AGENTS.md "Roteiro de verificação real" with `BOPS_RUNTIME=codex` and no `OPENAI_API_KEY`.
+Fakes only: Codex backend and OpenAI on localhost, `CODEX_HOME` in a temp dir with a made-up JWT, Codex's renewal stubbed on the `codex` object; the Codex app server it starts gets a dead proxy. Tasks use the same temporary state/workspace with the `codex` singleton stubbed and Agents API on localhost; Chrome, memory, routing decisions and notifications are stubbed. When the CLI is installed, task safety checks also start it with a temporary CODEX_HOME containing broad sandbox permissions and a fake MCP: no model turns, dead localhost proxies, effective policy and filtered tools asserted. Without the CLI, this extra check is explicitly skipped. Keep probe working folders outside the checkout so generated CLI skills are not linted as project source. Against the real backend: the root AGENTS.md "Roteiro de verificação real" with `BOPS_RUNTIME=codex` and no `OPENAI_API_KEY`.
 
 ## Child DOX Index
 
