@@ -4,11 +4,11 @@ import { botChatId, live, type Bot } from "@/lib/types";
 import { callEnded, callStarted } from "./attention";
 import { delegate, voicePrompt } from "./call";
 import { saveToMemory, wsOf } from "./memory";
-import { openaiClient } from "./openai-client";
+import { generateText, type TextTool } from "./runtime/text/index";
 import { callLog, fromOwner, isOwner, linkClaimed, routeFor, type ApEvent } from "./phone";
 import { addMessage, bot, getState, ownerLine, ownerName, patchSession } from "./store";
 import { SPEAKING } from "./style";
-import { recordCallMinutes, recordTokens } from "./usage";
+import { recordCallMinutes } from "./usage";
 
 /**
  * Calls to a bot's number, answered on this Mac. Every Bops number's calls go to its AgentPhone
@@ -20,7 +20,7 @@ import { recordCallMinutes, recordTokens } from "./usage";
  *   the user's own numbers, or the first caller in a new line's 15 minutes); self-hosting, the
  *   verified numbers here. A first call that claimed the line links that phone (linkClaimed).
  * - **The owner** gets the whole bot: the prompt of a call in the app (voicePrompt, "turns"), each
- *   turn one Responses call (a fast model, thinking lightly) with two tools. `delegate` hands real work
+ *   turn one answer from the text runtime (a fast model, thinking lightly) with two tools. `delegate` hands real work
  *   to the bot exactly as a call in the app does (delegate() in call.ts): the bot says it's on it, the
  *   work runs in its chat, and threads it starts text their results to the caller. `end_call` hangs up.
  * - **Anyone else** gets a bot that only chats and takes a message for the user: it's told nothing
@@ -36,16 +36,12 @@ import { recordCallMinutes, recordTokens } from "./usage";
 
 /** Tests shorten these. */
 export const voiceTiming = { idleMs: 2 * 60_000, promptMs: 4_000, turnMs: 12_000, fillerAfterMs: 1_500 };
-/** The model for a call's turns: quick, thinking lightly. */
-const MODEL = () => process.env.BOPS_PHONE_MODEL?.trim() || process.env.BOPS_CHAT_MODEL?.trim() || "gpt-6.1-sol";
 /** What the caller hears while a slow answer is on its way. */
 const FILLER = "Mm-hm, one sec.";
 /** Past this long, or this many of a stranger's turns, the bot says goodbye. */
 const MAX_OWNER_CALL_MS = 60 * 60_000;
 const MAX_STRANGER_CALL_MS = 10 * 60_000;
 const MAX_STRANGER_TURNS = 30;
-
-const client = openaiClient({ maxRetries: 0 });
 
 export type VoiceReply = { text: string; hangup?: boolean };
 type Turn = { who: "caller" | "bot"; text: string };
@@ -123,7 +119,7 @@ function workNotes(c: PhoneCall) {
 }
 
 const SAY = { type: "string", description: "What to say to the caller now, in one short sentence." };
-const tool = (name: string, description: string, properties: Record<string, unknown>) => ({
+const tool = (name: string, description: string, properties: Record<string, unknown>): TextTool => ({
   type: "function" as const,
   name,
   description,
@@ -160,22 +156,21 @@ const spoken = (t: string) =>
     .trim()
     .slice(0, 600);
 
-/** One Responses call for what the bot says next, and the tools it called. Its tokens are counted. */
-async function respond(b: Bot, c: PhoneCall, instructions: string, tools: ReturnType<typeof tool>[]) {
+/** One answer for what the bot says next, and the tools it called. Its tokens are counted (as a call's). */
+async function respond(b: Bot, c: PhoneCall, instructions: string, tools: TextTool[]) {
   const input = c.turns.length
     ? c.turns.map((t) => ({ role: t.who === "caller" ? ("user" as const) : ("assistant" as const), content: t.text }))
     : [{ role: "user" as const, content: "(The call just connected; the caller hasn't said anything yet. Say hello.)" }];
-  const r = await client.responses.create({ model: MODEL(), reasoning: { effort: "low" }, instructions, input, tools, parallel_tool_calls: false, max_output_tokens: 1200, store: false });
-  recordTokens("call", r.model, r.usage, b.id);
-  const called = r.output.flatMap((o) => {
-    if (o.type !== "function_call") return [];
+  // A quick model, thinking lightly (BOPS_PHONE_MODEL, else the chat's).
+  const r = await generateText({ role: "phone", effort: "low", instructions, input, tools, parallelTools: false, quick: { maxOutputTokens: 1200 }, usage: { source: "call", botId: b.id } });
+  const called = r.calls.map((o) => {
     try {
-      return [{ name: o.name, args: JSON.parse(o.arguments || "{}") as Record<string, unknown> }];
+      return { name: o.name, args: JSON.parse(o.arguments || "{}") as Record<string, unknown> };
     } catch {
-      return [{ name: o.name, args: {} as Record<string, unknown> }];
+      return { name: o.name, args: {} as Record<string, unknown> };
     }
   });
-  return { text: r.output_text ?? "", tools: called };
+  return { text: r.text, tools: called };
 }
 
 /** The words a turn's tools said, after the model's own. */

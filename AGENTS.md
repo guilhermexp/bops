@@ -39,6 +39,7 @@ Clone de `github.com/nickvasilescu/bops` mantido localmente pelo dono para self-
 
 - Self-hosting: `BOPS_SELF_HOSTED=1` em `.env.local`. Nesse modo o app não pede login Orgo (`authStatus` em `lib/server/orgo-sign-in.ts`); serviços são chamados diretamente com as chaves de `.env.local`.
 - Estado do app: `.data/state.json` relativo ao `cwd` do servidor (`lib/server/persist.ts`). Perfis Chrome e workspace dos bots: `~/.bops/` (`lib/server/local.ts`). Segredos: Keychain, item "Bops Vault" (`lib/server/keychain.ts`).
+- Modelos: por runtime (`lib/server/runtime/`, [AGENTS.md](lib/server/runtime/AGENTS.md)). `BOPS_RUNTIME` / `BOPS_<TEXT|TASK|VOICE>_RUNTIME`, ids `openai` (default, upstream) e `codex` (assinatura ChatGPT via login do Codex; `~/.codex/auth.json` só lido, nunca escrito). Chamadores de texto usam só `generateText` de `lib/server/runtime/text/index`. A instância do dono usa `BOPS_RUNTIME=codex`.
 - Nunca colocar chaves, telefones, e-mails ou dados pessoais em código, prompts, exemplos ou testes.
 
 ## Work Guidance
@@ -54,13 +55,15 @@ Gates estáticos (os mesmos do CI em `.github/workflows/ci.yml`):
 npx tsc --noEmit -p .
 npm run lint            # 0 errors; warnings preexistentes em site/
 node --conditions=react-server scripts/test-phone-voice.mjs
+node --conditions=react-server scripts/test-runtime-text.mjs
 ```
 
 Test Coverage Matrix:
 
 | Camada / path | Tier | Como rodar |
 |---|---|---|
-| `lib/server/phone-voice.ts`, `app/api/phone/agentphone` | integração com OpenAI/AgentPhone falsos | `node --conditions=react-server scripts/test-phone-voice.mjs` |
+| `lib/server/phone-voice.ts`, `app/api/phone/agentphone` | integração com OpenAI/backend Codex/AgentPhone falsos (runtimes openai e codex) | `node --conditions=react-server scripts/test-phone-voice.mjs` |
+| `lib/server/runtime/**`, chamadores de texto (`chat.ts`, `memory.ts`, `watches.ts`, `sessions.ts` `suggestReplies`), `lib/server/codex.ts` (app-server sobe na config do usuário) | integração com backend Codex/OpenAI falsos, `CODEX_HOME` temporário; Codex CLI real sem rede | `node --conditions=react-server scripts/test-runtime-text.mjs` |
 | `lib/server/**` demais | typecheck + lint | `npx tsc --noEmit -p .` · `npm run lint` |
 | fluxo do app | e2e real | roteiro abaixo |
 
@@ -68,7 +71,7 @@ Roteiro de verificação real (lido por `to-execute`):
 
 1. **Isolamento:** rodar a partir de um checkout/worktree próprio (o `.data/` dele é o sandbox) numa porta livre diferente de 3210, que é a instância de uso do dono. `.env.local` próprio no checkout de teste, copiado do principal. Registrar `shasum -a 256` de `<checkout principal>/.data/state.json` antes e depois: deve ficar inalterado. `~/.bops/` e o Keychain são compartilhados; usar só bots/dados criados pelo teste. `git check-ignore -q .tmp/` precisa passar.
 2. **Launch:** `npx next dev --port <porta>` no checkout de teste. Readiness: `curl -s http://127.0.0.1:<porta>/api/health` devolve `{"bops":true}`.
-3. **Doctor (read-only):** `curl -s http://127.0.0.1:<porta>/api/auth/status` devolve `"needsSignIn":false` em self-hosting; `codex login status` informa o login usado pelo runtime Codex.
+3. **Doctor (read-only):** `curl -s http://127.0.0.1:<porta>/api/auth/status` devolve `"needsSignIn":false` em self-hosting; `codex login status` informa o login usado pelo runtime Codex; `/api/state` → `mac.next` não é `codex` (app-server subiu).
 4. **Ação:** pelo navegador real em `http://127.0.0.1:<porta>`. Exemplo: mandar mensagem ao Boppy pelo campo "Text Boppy" e esperar a resposta na conversa.
 5. **Observável e efeitos:** a resposta aparece na UI **e** persiste em `<checkout de teste>/.data/state.json` (`messages` do chat).
 6. **Evidência:** `.tmp/verify/<ticket>/<item>/evidence.md`, com comando, saída literal e digest de cada anexo.
@@ -99,4 +102,4 @@ Criar AGENTS.md filho quando a pasta vira boundary durável com regra própria. 
 
 ## Child DOX Index
 
-Nenhum filho ainda.
+- [lib/server/runtime/AGENTS.md](lib/server/runtime/AGENTS.md) — runtimes de modelo (seleção, auth/cliente Codex, capacidade text; como adicionar um runtime).

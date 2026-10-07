@@ -3,13 +3,15 @@
 // whole bot (work handed to its chat as a call in the app does it), anyone else a bot that only takes a
 // message; who's calling is Bops Cloud's verdict when there is one; a first call that claimed the line
 // links that phone; the call's transcript lands in the bot's chat; slow answers stream a filler first.
-// Also the webhook route (a forged verdict on a direct delivery is ignored) and texts that follow the
-// cloud's verdict (lib/server/phone.ts). OpenAI is a fake on localhost and the state a throwaway file
-// store in a temporary folder: nothing reaches OpenAI, AgentPhone or Orgo, and nobody is texted.
+// Also the webhook route (a forged verdict on a direct delivery is ignored), texts that follow the
+// cloud's verdict (lib/server/phone.ts), and a call answered on the user's ChatGPT plan (the codex
+// runtime, with no OpenAI key). OpenAI and the Codex backend are fakes on localhost and the state a
+// throwaway file store in a temporary folder: nothing reaches OpenAI, ChatGPT, AgentPhone or Orgo, and
+// nobody is texted.
 // Usage: node --conditions=react-server scripts/test-phone-voice.mjs
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
@@ -81,14 +83,20 @@ const fake = createServer(async (req, res) => {
   const chunks = [];
   for await (const c of req) chunks.push(c);
   const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
-  if (req.method !== "POST" || req.url !== "/v1/responses") return void res.writeHead(404).end("{}");
+  // OpenAI's Responses API, and the Codex backend (the codex runtime: the same answer, streamed).
+  const codex = req.url === "/codex/responses";
+  if (req.method !== "POST" || (req.url !== "/v1/responses" && !codex)) return void res.writeHead(404).end("{}");
   const names = (body.tools ?? []).map((t) => t.name);
   const phone = names.includes("end_call");
-  asked.push({ phone, body });
+  asked.push({ phone, body, ...(codex ? { codex: true, headers: req.headers } : {}) });
   // The bot's chat (handed a call's work): it just answers.
   const r = phone ? phoneReply(body) : { text: "On it, sending now." };
   if (r.delayMs) await new Promise((done) => setTimeout(done, r.delayMs));
-  res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(responseOf(r)));
+  const answer = responseOf(r);
+  if (!codex) return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(answer));
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  for (const item of answer.output) res.write(`event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", item })}\n\n`);
+  res.end(`event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: answer.id, model: body.model, usage: answer.usage } })}\n\n`);
 });
 await new Promise((r) => fake.listen(0, "127.0.0.1", r));
 process.env.OPENAI_BASE_URL = `http://127.0.0.1:${fake.address().port}/v1`;
@@ -309,7 +317,50 @@ const until = async (check, what, ms = 5000) => {
   assert.equal(P.verdictOf(null), undefined);
 }
 
-console.log(`all phone voice tests passed (${asked.length} fake OpenAI calls, none to the network)`);
+/* ---------------- On the ChatGPT plan (the codex runtime) ---------------- */
+
+{
+  // The user's Codex sign-in (a made-up one, in a temporary Codex home), and no OpenAI key at all.
+  const home = join(scratch, "codex-home");
+  mkdirSync(home);
+  const claims = { exp: Math.floor(Date.now() / 1000) + 3600, "https://api.openai.com/auth": { chatgpt_account_id: "acct_test", chatgpt_plan_type: "pro" } };
+  const token = ["{}", JSON.stringify(claims), "sig"].map((p) => Buffer.from(p).toString("base64url")).join(".");
+  writeFileSync(join(home, "auth.json"), JSON.stringify({ tokens: { access_token: token, refresh_token: "rt-test", account_id: "acct_test" } }));
+  Object.assign(process.env, { BOPS_RUNTIME: "codex", CODEX_HOME: home, BOPS_CODEX_BASE_URL: `http://127.0.0.1:${fake.address().port}/codex`, BOPS_PHONE_MODEL: "gpt-6-luna" });
+  delete process.env.OPENAI_API_KEY;
+  const before = asked.length;
+  const tokensBefore = (S.getState().usage ?? []).filter((u) => u.kind === "model.tokens" && u.source === "call").length;
+  const call = `call_${++n}`;
+  phoneReply = () => ({ text: "Hi Alex!" });
+  const body = JSON.stringify(turn(OWNER, "", call));
+  const ts = String(Math.floor(Date.now() / 1000));
+  const sig = `sha256=${createHmac("sha256", "whsec-test").update(`${ts}.${body}`).digest("hex")}`;
+  const res = await route.POST(new Request("http://127.0.0.1:3210/api/phone/agentphone", { method: "POST", headers: { "content-type": "application/json", "x-webhook-timestamp": ts, "x-webhook-signature": sig }, body }));
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { text: "Hi Alex!" }, "the hello, answered on the plan");
+  const hello = asked.at(-1);
+  assert.equal(hello.codex, true, "asked the Codex backend");
+  assert.equal(hello.headers.authorization, `Bearer ${token}`);
+  assert.equal(hello.headers["chatgpt-account-id"], "acct_test");
+  assert.equal(hello.body.model, "gpt-6-luna", "BOPS_PHONE_MODEL");
+  assert.equal(hello.body.store, false);
+  assert.equal(hello.body.stream, true);
+  assert.equal(hello.body.parallel_tool_calls, false);
+  assert.ok(!("max_output_tokens" in hello.body), "the backend turns down max_output_tokens");
+  assert.deepEqual(hello.body.tools.map((t) => t.name), ["delegate", "end_call"]);
+  assert.deepEqual(hello.body.input, [{ role: "user", content: "(The call just connected; the caller hasn't said anything yet. Say hello.)" }]);
+  // Work handed to the chat runs there on the plan too.
+  phoneReply = () => ({ tools: [{ name: "delegate", args: { request: "Text Jordan I'm late", say: "On it." } }] });
+  assert.deepEqual(await V.voiceTurn(turn(OWNER, "Text Jordan I'm running late", call)), { text: "On it." });
+  await until(() => messages().some((m) => m.role === "user" && m.text === "Text Jordan I'm late") && asked.slice(before).some((a) => a.codex && !a.phone), "the bot's chat to take the work on the plan");
+  assert.ok(asked.slice(before).every((a) => a.codex), "nothing to OpenAI");
+  V.phoneCallEnded(turn(OWNER, "", call));
+  assert.equal((S.getState().usage ?? []).filter((u) => u.kind === "model.tokens" && u.source === "call").length, tokensBefore + 2, "each turn's tokens, as a call's");
+  for (const k of ["BOPS_RUNTIME", "CODEX_HOME", "BOPS_CODEX_BASE_URL", "BOPS_PHONE_MODEL"]) delete process.env[k];
+  console.log("codex call ->", asked.length - before, "calls to the fake Codex backend");
+}
+
+console.log(`all phone voice tests passed (${asked.length} fake OpenAI and Codex calls, none to the network)`);
 fake.close();
 rmSync(scratch, { recursive: true, force: true });
 process.exit(0);

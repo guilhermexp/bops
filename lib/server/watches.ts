@@ -8,8 +8,7 @@ import { orgo } from "./orgo";
 import { sameComputer, screenEndpoint, workComputer } from "./screens";
 import { ensureScreenTools, startSession, stopSession } from "./sessions";
 import { addMessage, bot, getState, id, ownerName, patchSession, session, update } from "./store";
-import { recordTokens } from "./usage";
-import { openaiClient } from "./openai-client";
+import { generateText } from "./runtime/text/index";
 import { knownSite, siteOf } from "@/lib/watch-sites";
 
 /**
@@ -48,8 +47,6 @@ function busy(botId: string, display: number) {
 
 const screenNo = (display: number) => DISPLAYS.indexOf(display) + 1;
 
-const client = openaiClient();
-const SUGGEST_MODEL = process.env.BOPS_CHAT_MODEL ?? process.env.BOPS_SAM_MODEL ?? "gpt-6.1-sol";
 export type Suggestion = { site: string; lookFor: string; picks: string[] };
 const suggested = new Map<string, { at: number; s: Suggestion }>();
 
@@ -69,33 +66,29 @@ export async function suggestWatch(botId: string, display: number): Promise<Sugg
   if (hit && Date.now() - hit.at < 30 * 60_000) return hit.s;
   const owner = ownerName();
   try {
-    const res = await client.responses.create({
-      model: SUGGEST_MODEL,
-      reasoning: { effort: "low" },
+    // A suggestion in the app, counted with chat (the ledger has no kind of its own for it).
+    const res = await generateText({
+      role: "chat",
+      effort: "low",
       instructions:
         `${owner} can ask their bot to keep a screen on a web page and give them a heads-up when something on it is worth their attention. Given the page, name the site the way ${owner} would say it, suggest 3 or 4 short things (2 to 5 words each) they would most plausibly want a heads-up about on THIS page, and one plain sentence describing the most useful default. Only suggest things that can actually appear or change on this page.`,
       input: JSON.stringify({ url: page.url, title: page.title, text: page.lines.slice(0, 50).join("\n").slice(0, 3500) }),
-      text: {
-        format: {
-          type: "json_schema",
-          name: "watch_suggestion",
-          strict: true,
-          schema: {
-            type: "object",
-            additionalProperties: false,
-            required: ["site", "picks", "lookFor"],
-            properties: {
-              site: { type: "string", description: "Short site name, e.g. Hacker News, Kitco, Zillow" },
-              picks: { type: "array", items: { type: "string" }, description: "3 or 4 quick picks, 2 to 5 words each" },
-              lookFor: { type: "string", description: `One plain sentence, in ${owner}'s voice, of the most useful default` },
-            },
+      json: {
+        name: "watch_suggestion",
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["site", "picks", "lookFor"],
+          properties: {
+            site: { type: "string", description: "Short site name, e.g. Hacker News, Kitco, Zillow" },
+            picks: { type: "array", items: { type: "string" }, description: "3 or 4 quick picks, 2 to 5 words each" },
+            lookFor: { type: "string", description: `One plain sentence, in ${owner}'s voice, of the most useful default` },
           },
         },
       },
+      usage: { source: "chat", botId },
     });
-    // A suggestion in the app, counted with chat (the ledger has no kind of its own for it).
-    recordTokens("chat", res.model, res.usage, botId);
-    const s = JSON.parse(res.output_text) as Suggestion;
+    const s = JSON.parse(res.text) as Suggestion;
     const clean: Suggestion = { site: s.site.trim().slice(0, 40) || usual.site, lookFor: s.lookFor.trim().slice(0, 200) || usual.lookFor, picks: s.picks.map((p) => p.trim()).filter(Boolean).slice(0, 4) };
     if (!clean.picks.length) return usual;
     suggested.set(page.url, { at: Date.now(), s: clean });
@@ -466,15 +459,14 @@ export async function watchInstead(sessionId: string, text: string): Promise<Wat
   );
   if ((yes(a?.ongoing) ?? 0) < 0.7) return null;
   // What to watch for, short and in their words ("Bitcoin goes above $86,000").
-  const res = await client.responses
-    .create({
-      model: SUGGEST_MODEL,
-      reasoning: { effort: "low" },
-      instructions: `${owner} asked for a screen to be watched. Write what to watch for as one short phrase in their words, like "Bitcoin goes above $86,000" or "a reply from Dana". Just the phrase.`,
-      input: `Screen: ${s.title}. ${owner}: ${text.slice(0, 1500)}`,
-    })
-    .catch(() => null);
-  const lookFor = res?.output_text?.trim().replace(/^["“]|["”.]$/g, "").slice(0, 200) || text.slice(0, 200);
+  const res = await generateText({
+    role: "chat",
+    effort: "low",
+    instructions: `${owner} asked for a screen to be watched. Write what to watch for as one short phrase in their words, like "Bitcoin goes above $86,000" or "a reply from Dana". Just the phrase.`,
+    input: `Screen: ${s.title}. ${owner}: ${text.slice(0, 1500)}`,
+    usage: { source: "chat", botId: s.botId },
+  }).catch(() => null);
+  const lookFor = res?.text.trim().replace(/^["“]|["”.]$/g, "").slice(0, 200) || text.slice(0, 200);
   if (live(s)) {
     stopSession(s.id, "Handed to a watch");
     for (let i = 0; i < 60 && live(session(s.id)!); i++) await new Promise((r) => setTimeout(r, 250));

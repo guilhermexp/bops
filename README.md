@@ -86,7 +86,7 @@ Everything runs on your Mac except the bots' computers and the providers. `edge/
 ## Requirements
 
 - macOS on Apple Silicon, Node 22 or newer.
-- **Required:** an OpenAI API key and an Orgo account.
+- **Required:** an OpenAI API key and an Orgo account. Text (chat, phone turns) can run on your ChatGPT plan instead: see [Model runtimes](#model-runtimes).
 - **Recommended:** Typesafe (small judgment calls), Honcho (memory), Composio (apps), AgentMail (email), Tailscale (direct live view of the bots' screens).
 - **Optional:** AgentPhone plus a public URL for texts and calls (see `edge/`).
 - **For "Your Mac":** the Codex CLI signed in with ChatGPT (with computer use), and `cua-driver` (default `~/.local/bin/cua-driver`). macOS asks for Screen Recording and Accessibility.
@@ -110,6 +110,19 @@ The app is designed for hosted Bops, where every service is run for the user, so
 ### The bots' computers
 
 Bot computers launch from an Orgo template built from this repo: `node orgo/bops-base.mjs publish`. Set `BOPS_ORGO_TEMPLATE` to your build's ref if the default isn't in your account. Bops keeps its computers in one Orgo workspace (the signed-in user's workspace named "bops", or `BOPS_ORGO_WORKSPACE` when self-hosting on `ORGO_API_KEY`) and never creates or deletes computers outside it.
+
+### Model runtimes
+
+Bops reaches its models through a runtime (`lib/server/runtime/`). `openai` (the default) uses OpenAI's API with `OPENAI_API_KEY`, or Bops Cloud when signed in with Orgo. `codex` uses your ChatGPT plan through the account you signed in to Codex with (`codex login`, or **Settings → This Mac → Sign in**): Bops reads `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`), never writes it, and asks Codex to renew the sign-in when it runs out.
+
+```bash
+BOPS_RUNTIME=codex          # every capability
+BOPS_TEXT_RUNTIME=codex     # or one at a time: text (chat, memory, watches, suggested replies, phone turns),
+BOPS_TASK_RUNTIME=openai    # tasks (threads on a computer),
+BOPS_VOICE_RUNTIME=openai   # voice (calls in the app)
+```
+
+Today `codex` covers text only: tasks and voice still run on OpenAI whatever their setting says (they don't read it yet). On `codex`, text counts against your plan's 5-hour and weekly limits, and when a limit is reached the bot says so and when it's back. The backend it uses (`chatgpt.com/backend-api/codex`) isn't a public API: it can change, and it's for your own use on your own Mac only. `BOPS_CHAT_MODEL` and `BOPS_PHONE_MODEL` pick the models in both runtimes.
 
 ### Texts and calls (optional)
 
