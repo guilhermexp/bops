@@ -31,8 +31,8 @@ const CHROME_VERSION = (() => {
 const USER_AGENT = `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VERSION.split(".")[0]}.0.0.0 Safari/537.36`;
 const PLAYWRIGHT_MCP = join(process.cwd(), "node_modules/@playwright/mcp/cli.js");
 
-/** One port per bot screen: 9300 + 10 per bot + screen index. */
-export const cdpPort = (botIndex: number, display: number) => 9300 + botIndex * 10 + DISPLAYS.indexOf(display);
+/** One port per bot screen; tests can choose a separate range from the running app. */
+export const cdpPort = (botIndex: number, display: number) => Number(process.env.BOPS_CDP_BASE_PORT?.trim() || 9300) + botIndex * 10 + DISPLAYS.indexOf(display);
 
 async function cdpUp(port: number) {
   try {
@@ -93,6 +93,12 @@ export const browserMcp = (port: number) => {
     ? { type: "stdio", command: "/usr/bin/env", args: ["ELECTRON_RUN_AS_NODE=1", process.execPath, ...args], cwd: WORKSPACE }
     : { type: "stdio", command: process.execPath, args, cwd: WORKSPACE };
 };
+
+/** App-server's stdio MCP config for the same bot browser. */
+export function browserServer(port: number, workspace: string) {
+  const { command, args } = browserMcp(port);
+  return { command, args, cwd: workspace, tool_timeout_sec: 120, required: true, default_tools_approval_mode: "approve" };
+}
 
 /** Start `codex exec-server` for one session; it dials out to OpenAI and runs the agent's tools here. */
 export async function startExecutor(envId: string, remoteUrl: string, port: number): Promise<ChildProcess> {

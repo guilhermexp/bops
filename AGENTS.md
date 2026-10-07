@@ -52,10 +52,12 @@ Clone de `github.com/nickvasilescu/bops` mantido localmente pelo dono para self-
 Gates estáticos (os mesmos do CI em `.github/workflows/ci.yml`):
 
 ```bash
+npx next typegen
 npx tsc --noEmit -p .
 npm run lint            # 0 errors; warnings preexistentes em site/
 node --conditions=react-server scripts/test-phone-voice.mjs
 node --conditions=react-server scripts/test-runtime-text.mjs
+node --conditions=react-server scripts/test-runtime-tasks.mjs
 ```
 
 Test Coverage Matrix:
@@ -63,13 +65,14 @@ Test Coverage Matrix:
 | Camada / path | Tier | Como rodar |
 |---|---|---|
 | `lib/server/phone-voice.ts`, `app/api/phone/agentphone` | integração com OpenAI/backend Codex/AgentPhone falsos (runtimes openai e codex) | `node --conditions=react-server scripts/test-phone-voice.mjs` |
-| `lib/server/runtime/**`, chamadores de texto (`chat.ts`, `memory.ts`, `watches.ts`, `sessions.ts` `suggestReplies`), `lib/server/codex.ts` (app-server sobe na config do usuário) | integração com backend Codex/OpenAI falsos, `CODEX_HOME` temporário; Codex CLI real sem rede | `node --conditions=react-server scripts/test-runtime-text.mjs` |
+| `lib/server/runtime/text/**`, `lib/server/runtime/codex/**`, chamadores de texto (`chat.ts`, `memory.ts`, `watches.ts`, `sessions.ts` `suggestReplies`), `lib/server/codex.ts` (app-server sobe na config do usuário) | integração com backend Codex/OpenAI falsos, `CODEX_HOME` temporário; Codex CLI real sem rede | `node --conditions=react-server scripts/test-runtime-text.mjs` |
+| `lib/server/runtime/tasks/**`, `sessions.ts` (tarefas) | integração com singleton app-server e Agents API falsos, workspace/estado temporários; inclui ciclo da sessão e chat | `node --conditions=react-server scripts/test-runtime-tasks.mjs` |
 | `lib/server/**` demais | typecheck + lint | `npx tsc --noEmit -p .` · `npm run lint` |
 | fluxo do app | e2e real | roteiro abaixo |
 
 Roteiro de verificação real (lido por `to-execute`):
 
-1. **Isolamento:** rodar a partir de um checkout/worktree próprio (o `.data/` dele é o sandbox) numa porta livre diferente de 3210, que é a instância de uso do dono. `.env.local` próprio no checkout de teste, copiado do principal. Registrar `shasum -a 256` de `<checkout principal>/.data/state.json` antes e depois: deve ficar inalterado. `~/.bops/` e o Keychain são compartilhados; usar só bots/dados criados pelo teste. `git check-ignore -q .tmp/` precisa passar.
+1. **Isolamento:** rodar a partir de um checkout/worktree próprio (o `.data/` dele é o sandbox) numa porta livre diferente de 3210, que é a instância de uso do dono. `.env.local` próprio no checkout de teste, copiado do principal. Registrar `shasum -a 256` de `<checkout principal>/.data/state.json` antes e depois: deve ficar inalterado. `~/.bops/` e o Keychain são compartilhados; usar só bots/dados criados pelo teste. Para tarefas de navegador, definir `BOPS_CDP_BASE_PORT` num intervalo livre (default 9300) evita reutilizar o Chrome da instância do dono. `git check-ignore -q .tmp/` precisa passar.
 2. **Launch:** `npx next dev --port <porta>` no checkout de teste. Readiness: `curl -s http://127.0.0.1:<porta>/api/health` devolve `{"bops":true}`.
 3. **Doctor (read-only):** `curl -s http://127.0.0.1:<porta>/api/auth/status` devolve `"needsSignIn":false` em self-hosting; `codex login status` informa o login usado pelo runtime Codex; `/api/state` → `mac.next` não é `codex` (app-server subiu).
 4. **Ação:** pelo navegador real em `http://localhost:<porta>` (não `127.0.0.1`: o `next dev` bloqueia esse origin para os recursos de dev e a página fica em "Loading Bops…"). Exemplo: mandar mensagem ao Boppy pelo campo "Text Boppy" e esperar a resposta na conversa.
@@ -102,4 +105,4 @@ Criar AGENTS.md filho quando a pasta vira boundary durável com regra própria. 
 
 ## Child DOX Index
 
-- [lib/server/runtime/AGENTS.md](lib/server/runtime/AGENTS.md) — runtimes de modelo (seleção, auth/cliente Codex, capacidade text; como adicionar um runtime).
+- [lib/server/runtime/AGENTS.md](lib/server/runtime/AGENTS.md) — runtimes de modelo (seleção, auth/cliente Codex, capacidades text/tasks; como adicionar um runtime).

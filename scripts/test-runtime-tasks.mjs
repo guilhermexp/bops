@@ -1,0 +1,571 @@
+// Tasks capability (lib/server/runtime/tasks): threads on the user's ChatGPT plan through Codex's
+// app-server (Mac Chrome via Playwright MCP, live web search, workspace commands, reasoning captions,
+// steps, a later reply on the same thread, stop, resume, tokens), a cloud computer refused with the
+// runtime to use, and the OpenAI Agents API path unchanged. The app-server is the codex singleton
+// stubbed here; the Agents API is a fake on localhost; Codex's home and the Mac workspace are a
+// temporary folder. Nothing reaches the network.
+// Usage: node --conditions=react-server scripts/test-runtime-tasks.mjs
+import assert from "node:assert/strict";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { registerHooks, stripTypeScriptTypes } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+for (const k of ["BOPS_DATABASE_URL", "ORGO_API_KEY", "OPENAI_API_KEY", "OPENAI_EXECUTOR_API_KEY", "BOPS_RUNTIME", "BOPS_TEXT_RUNTIME", "BOPS_TASK_RUNTIME", "BOPS_VOICE_RUNTIME", "BOPS_SESSION_MODEL", "BOPS_HARD_MODEL", "BOPS_CHAT_MODEL", "BOPS_CODEX_BASE_URL"])
+  delete process.env[k];
+const scratch = mkdtempSync(join(tmpdir(), "bops-test-runtime-tasks-"));
+const codexHome = join(scratch, "codex-home");
+const bin = join(scratch, "bin");
+mkdirSync(codexHome, { recursive: true });
+mkdirSync(bin, { recursive: true });
+// Stays quiet: the OpenAI executor treats a few seconds without "error" as connected.
+writeFileSync(join(bin, "codex"), "#!/bin/sh\nsleep 30\n");
+chmodSync(join(bin, "codex"), 0o755);
+const authPath = join(codexHome, "auth.json");
+const jwt = (payload) => {
+  const part = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+  return `${part({ alg: "none", typ: "JWT" })}.${part(payload)}.x`;
+};
+const signIn = () =>
+  writeFileSync(
+    authPath,
+    JSON.stringify({
+      tokens: {
+        access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600, "https://api.openai.com/auth": { chatgpt_account_id: "acct_test", chatgpt_plan_type: "pro" } }),
+        account_id: "acct_test",
+      },
+    }),
+  );
+signIn();
+Object.assign(process.env, {
+  BOPS_SELF_HOSTED: "1",
+  CODEX_HOME: codexHome,
+  PATH: `${bin}:${process.env.PATH}`,
+  OPENAI_API_KEY: "sk-test-not-a-real-key",
+  HTTPS_PROXY: "http://127.0.0.1:9",
+  HTTP_PROXY: "http://127.0.0.1:9",
+  ALL_PROXY: "http://127.0.0.1:9",
+  NO_PROXY: "127.0.0.1,localhost",
+});
+process.chdir(scratch);
+globalThis.bopsOrgoKey = null;
+globalThis.bopsOrgoKeyMissAt = Infinity;
+
+const calls = [];
+let heldTurn;
+let holdNextTurn = false;
+const listeners = new Map();
+globalThis.__bopsTestCodex = {
+  ready: async () => {},
+  request: async (method, params) => {
+    calls.push({ method, params: JSON.parse(JSON.stringify(params ?? {})) });
+    if (method === "config/read") return { config: { mcp_servers: { personal_browser: { command: "false" } }, plugins: { "other@test": { enabled: true } } } };
+    if (method === "skills/list") return { data: [{ skills: [{ path: "/tmp/private-skill/SKILL.md", pluginId: null }, { path: "/tmp/computer-use/SKILL.md", pluginId: "unified-computer-use@openai-bundled" }] }] };
+    if (method === "thread/start") return { thread: { id: "thr_1" } };
+    if (method === "thread/resume") return { thread: { id: params.threadId } };
+    if (method === "turn/start" && holdNextTurn) { holdNextTurn = false; return await new Promise((resolve) => heldTurn = resolve); }
+    if (method === "turn/start") return { turn: { id: `turn_${calls.filter((c) => c.method === "turn/start").length}` } };
+    return {};
+  },
+  on: (id, fn) => listeners.set(id, fn),
+  off: (id) => listeners.delete(id),
+  waiting: new Map(),
+  sessionApps: new Map(),
+};
+const emit = (threadId, method, params = {}) => listeners.get(threadId)?.({ method, params: { threadId, ...params } });
+
+const root = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+const STAND_INS = new Set(["codex", "orgo", "relay", "desktop", "mirror", "memory", "decide", "briefing", "screen-watch", "attention", "mail", "phone", "channels", "skills", "plan", "tailnet", "vault"]);
+registerHooks({
+  resolve(specifier, context, next) {
+    if (specifier.startsWith("@/")) specifier = pathToFileURL(`${root}/${specifier.slice(2)}`).href;
+    try {
+      return next(specifier, context);
+    } catch (e) {
+      if (/^(\.{1,2}\/|\/|file:)/.test(specifier))
+        for (const ext of [".ts", ".tsx"])
+          try {
+            return next(specifier + ext, context);
+          } catch {}
+      throw e;
+    }
+  },
+  load(url, context, next) {
+    if (url.endsWith("/lib/server/local.ts")) {
+      const source = readFileSync(new URL(url), "utf8").replace('join(homedir(), ".bops")', `join(${JSON.stringify(scratch)}, ".bops")`).replace("export async function ensureChrome(", "async function unusedChrome(");
+      return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source + "\nexport async function ensureChrome() {}") };
+    }
+    const name = url.match(/\/lib\/server\/([a-z-]+)\.ts$/)?.[1];
+    if (!name || !STAND_INS.has(name)) return next(url, context);
+    if (name === "orgo")
+      return {
+        format: "module",
+        shortCircuit: true,
+        source: `export const orgo = { bash: async () => ({ exit_code: 0, output: "ok" }) };\nexport class OrgoError extends Error {}\nexport const screenId = () => "";\n`,
+      };
+    const names = [...readFileSync(new URL(url), "utf8").matchAll(/^export (?:async )?(?:function\*? |const |let |class )([A-Za-z_$][\w$]*)/gm)].map((m) => m[1]);
+    const source = names
+      .map((n) => (n === "watchScreen" ? "export const watchScreen = () => () => {};" : n === "codex" ? "export const codex = globalThis.__bopsTestCodex;" : n === "emptyMac" ? "export const emptyMac = () => ({ ready: false, approvals: [], alwaysApps: [], rules: [] });" : `export const ${n} = function () { return Promise.resolve(); };`))
+      .join("\n");
+    return { format: "module", shortCircuit: true, source };
+  },
+});
+
+const realFetch = globalThis.fetch;
+globalThis.fetch = (input, init) => {
+  const url = new URL(typeof input === "string" || input instanceof URL ? String(input) : input.url);
+  if (url.hostname !== "127.0.0.1") throw new Error(`not a fake: ${url.hostname}`);
+  return realFetch(input, init);
+};
+
+const agentBodies = [];
+const agentInputs = [];
+const agentStreams = new Map();
+const agentItems = new Map();
+const fake = createServer(async (req, res) => {
+  const url = new URL(req.url, "http://127.0.0.1");
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const raw = Buffer.concat(chunks).toString();
+  if (req.method === "POST" && url.pathname === "/v1/agents/sessions") {
+    agentBodies.push(JSON.parse(raw || "{}"));
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ id: `sess_${agentBodies.length}`, environment: { id: `env_${agentBodies.length}`, remote_url: "http://127.0.0.1:9/remote" } }));
+    return;
+  }
+  const path = url.pathname;
+  const sid = path.split("/")[4];
+  if (req.method === "GET" && path.endsWith("/events")) {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.flushHeaders();
+    agentStreams.set(sid, res);
+    return;
+  }
+  if (req.method === "POST" && path.endsWith("/events")) {
+    agentInputs.push(JSON.parse(raw));
+    res.writeHead(202); res.end();
+    const stream = agentStreams.get(sid);
+    const items = [
+      { id: "reason_open", type: "reasoning", summary: [{ text: "Checking the page." }] },
+      { id: "nav_open", type: "mcp_call", name: "browser_navigate", arguments: { url: "https://example.com" } },
+      { id: "final_open", type: "message", role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "OpenAI Example Domain" }] },
+    ];
+    agentItems.set(sid, items);
+    for (const event of [
+      { type: "agent.session.turn.created", turn_id: "open_turn", turn: { subagent_id: null } },
+      ...items.map((item) => ({ type: "agent.session.turn.item.done", turn_id: "open_turn", item })),
+      { type: "agent.session.turn.completed", turn_id: "open_turn", usage: { input_tokens: 30, output_tokens: 10 } },
+    ]) stream.write(`data: ${JSON.stringify(event)}\n\n`);
+    stream.end();
+    return;
+  }
+  if (req.method === "GET" && path.endsWith("/items")) {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ data: [...(agentItems.get(sid) ?? [])].reverse(), has_more: false, object: "list" }));
+    return;
+  }
+  res.statusCode = 404;
+  res.end("not found");
+});
+await new Promise((r) => fake.listen(0, "127.0.0.1", r));
+process.env.OPENAI_BASE_URL = `http://127.0.0.1:${fake.address().port}/v1`;
+
+
+const local = await import(`${root}/lib/server/local.ts`);
+const store = await import(`${root}/lib/server/store.ts`);
+const cloud = await import(`${root}/lib/server/cloud.ts`);
+const { CodexLimitError } = await import(`${root}/lib/server/runtime/codex/client.ts`);
+const { CodexSignInError } = await import(`${root}/lib/server/runtime/codex/auth.ts`);
+
+// Run the application's session runner first: even without an API key, a Mac browser task
+// must get its answer from Codex and persist the result in the chat.
+const sessions = await import(`${root}/lib/server/sessions.ts`);
+process.env.BOPS_RUNTIME = "codex";
+delete process.env.OPENAI_API_KEY;
+store.update((s) => {
+  s.host = "mac";
+  s.bots[0].effort = "medium";
+});
+const appSession = sessions.startSession({ botId: "boppy", goal: "Open https://example.com and tell me the title.", title: "Example page", where: "cloud", fresh: true });
+const until = Date.now() + 2000;
+while (Date.now() < until && !ofBefore("turn/start").length && store.session(appSession.id)?.status !== "failed") await new Promise((r) => setTimeout(r, 10));
+function ofBefore(method) { return calls.filter((c) => c.method === method); }
+const appThread = ofBefore("thread/start").at(-1)?.params;
+if (appThread) {
+  const threadId = store.session(appSession.id).codexThread;
+  emit(threadId, "item/completed", { item: { id: "answer", type: "agentMessage", text: "Example Domain" } });
+  emit(threadId, "turn/completed", { turn: { id: "turn_1", status: "completed" } });
+  for (let i = 0; i < 100 && store.session(appSession.id)?.status !== "done"; i++) await new Promise((r) => setTimeout(r, 10));
+}
+assert.equal(store.session(appSession.id)?.answer, "Example Domain", `Mac tasks on codex must answer without OPENAI_API_KEY (session error: ${store.session(appSession.id)?.error})`);
+assert.equal(store.session(appSession.id)?.status, "done");
+assert.ok(store.getState().messages.some((m) => m.resultOf === appSession.id && m.text === "Example Domain"), "the task's answer reaches the chat");
+assert.equal(agentBodies.length, 0);
+// Reply after completion exercises persisted ids, not an in-memory adapter handle.
+const savedThread = store.session(appSession.id).codexThread;
+sessions.replyToSession(appSession.id, "And its first heading?");
+for (let i = 0; i < 100 && ofBefore("turn/start").length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+assert.equal(ofBefore("thread/resume").at(-1)?.params.threadId, savedThread);
+assert.equal(ofBefore("turn/start").at(-1)?.params.threadId, savedThread);
+emit(savedThread, "item/completed", { item: { id: "followup", type: "agentMessage", text: "Example Domain again" } });
+emit(savedThread, "turn/completed", { turn: { id: "turn_2", status: "completed" } });
+for (let i = 0; i < 100 && store.session(appSession.id)?.status !== "done"; i++) await new Promise((r) => setTimeout(r, 10));
+assert.equal(store.session(appSession.id).answer, "Example Domain again");
+assert.equal(ofBefore("thread/start").length, 1);
+// Stop through the session runner must leave a terminal state and no current turn id.
+sessions.replyToSession(appSession.id, "Keep researching.");
+for (let i = 0; i < 100 && ofBefore("turn/start").length < 3; i++) await new Promise((r) => setTimeout(r, 10));
+sessions.stopSession(appSession.id);
+await new Promise((r) => setImmediate(r));
+assert.equal(ofBefore("turn/interrupt").at(-1)?.params.threadId, savedThread);
+emit(savedThread, "turn/completed", { turn: { id: "turn_3", status: "interrupted" } });
+for (let i = 0; i < 100 && store.session(appSession.id)?.status !== "failed"; i++) await new Promise((r) => setTimeout(r, 10));
+assert.equal(store.session(appSession.id).error, "Stopped by you");
+assert.equal(store.session(appSession.id).codexTurn, undefined);
+store.update((s) => { s.host = "orgo"; });
+const refused = sessions.startSession({ botId: "boppy", goal: "A separate cloud job", where: "cloud", fresh: true });
+for (let i = 0; i < 100 && store.session(refused.id)?.status !== "failed"; i++) await new Promise((r) => setTimeout(r, 10));
+assert.match(store.session(refused.id)?.error ?? "", /BOPS_TASK_RUNTIME=openai/);
+assert.equal(store.getState().bots[0].computerStatus, "none", "no Orgo computer was provisioned");
+assert.equal(agentBodies.length, 0);
+store.update((s) => { s.host = "mac"; });
+console.log("session lifecycle -> persisted thread resumed, stop saved, Orgo refused before provisioning");
+calls.length = 0;
+store.update((s) => { s.sessions = []; s.messages = []; });
+process.env.OPENAI_API_KEY = "sk-test-not-a-real-key";
+console.log("session runner -> Mac task answered and saved in chat without an OpenAI key");
+if (process.argv.includes("red")) { fake.close(); rmSync(scratch, { recursive: true, force: true }); process.exit(0); }
+const tasks = await import(`${root}/lib/server/runtime/tasks/index.ts`);
+
+const workspace = local.WORKSPACE;
+const instructions = "You are Boppy, the chief of staff bot in Bops.";
+const macPlace = { host: "mac", cdpPort: 9300, workspace };
+const orgoPlace = { host: "orgo", computerId: "comp_test", display: 100, sessionId: "ses_test", botId: "boppy", workspace: "/workspace" };
+const macOpen = (extra = {}) => ({ instructions, effort: "medium", place: macPlace, botId: "boppy", ...extra });
+const tick = () => new Promise((r) => setImmediate(r));
+const of = (method) => calls.filter((c) => c.method === method);
+
+/* ---------------- Which runtime runs tasks ---------------- */
+
+{
+  delete process.env.BOPS_RUNTIME;
+  delete process.env.BOPS_TASK_RUNTIME;
+  assert.doesNotThrow(() => tasks.tasksRuntime().assertHost("orgo"), "openai runs a cloud computer");
+  process.env.BOPS_TASK_RUNTIME = "nope";
+  assert.throws(() => tasks.tasksRuntime(), /Unknown runtime "nope" in BOPS_TASK_RUNTIME/);
+  delete process.env.BOPS_TASK_RUNTIME;
+  process.env.BOPS_RUNTIME = "codex";
+  assert.throws(() => tasks.tasksRuntime().assertHost("orgo"), /BOPS_TASK_RUNTIME=openai/);
+  process.env.BOPS_TASK_RUNTIME = "openai";
+  assert.doesNotThrow(() => tasks.tasksRuntime().assertHost("orgo"), "BOPS_TASK_RUNTIME wins over BOPS_RUNTIME");
+  delete process.env.BOPS_TASK_RUNTIME;
+  console.log("selection -> openai by default, codex refuses a cloud computer, per-capability override");
+}
+
+/* ---------------- A Mac task on the Codex app-server ---------------- */
+
+{
+  const rt = tasks.tasksRuntime();
+  const steps = [];
+  const captions = [];
+  process.env.BOPS_SESSION_MODEL = "";
+  const thread = await rt.open(macOpen());
+  delete process.env.BOPS_SESSION_MODEL;
+  assert.equal(thread.id, "thr_1");
+  const started = of("thread/start").at(-1).params;
+  assert.equal(started.model, "gpt-6.1-sol");
+  assert.equal(started.cwd, workspace);
+  assert.equal(started.approvalPolicy, "never");
+  assert.equal(started.sandbox, "workspace-write");
+  assert.equal(started.developerInstructions, instructions);
+  assert.equal(started.serviceName, "Bops");
+  assert.equal(started.config.web_search, "live");
+  assert.equal(started.config.mcp_servers.personal_browser.enabled, false);
+  assert.equal(started.config.plugins["other@test"].enabled, false);
+  assert.equal(started.config.project_doc_max_bytes, 0);
+  assert.deepEqual(started.config.skills.config, [{ path: "/tmp/private-skill/SKILL.md", enabled: false }, { path: "/tmp/computer-use/SKILL.md", enabled: false }]);
+  assert.deepEqual(started.config.mcp_servers.browser, local.browserServer(9300, workspace));
+  assert.equal(agentBodies.length, 0, "the Agents API wasn't asked");
+  try {
+    const hooks = () => ({
+      step: (tool, detail) => steps.push({ tool, detail }),
+      caption: (text) => captions.push(text),
+      isStopped: () => false,
+      bindStop: () => {},
+    });
+    const first = rt.turn({ thread, input: "Open https://example.com and tell me the title.", effort: "medium", botId: "boppy", epoch: store.stateEpoch(), hooks: hooks() });
+    await tick();
+    const turn = of("turn/start").at(-1).params;
+    assert.equal(turn.threadId, "thr_1");
+    assert.equal(turn.model, "gpt-6.1-sol");
+    assert.equal(turn.effort, "medium");
+    assert.equal(turn.summary, "auto");
+    assert.deepEqual(turn.input, [{ type: "text", text: "Open https://example.com and tell me the title." }]);
+    emit("thr_1", "item/reasoning/summaryTextDelta", { delta: "Checking the example page. " });
+    emit("thr_1", "item/started", { item: { id: "nav", type: "mcpToolCall", server: "browser", tool: "browser_navigate", arguments: { url: "https://example.com" } } });
+    emit("thr_1", "item/completed", { item: { id: "ws1", type: "webSearch", action: { type: "search", query: "example domain" } } });
+    emit("thr_1", "item/started", { item: { id: "cmd", type: "commandExecution", command: "ls" } });
+    emit("thr_1", "item/completed", { item: { id: "msg", type: "agentMessage", text: "Example Domain" } });
+    emit("thr_1", "thread/tokenUsage/updated", {
+      turnId: "turn_1",
+      tokenUsage: {
+        last: { inputTokens: 100, outputTokens: 20, totalTokens: 120, cachedInputTokens: 0, reasoningOutputTokens: 0 },
+        total: { inputTokens: 100, outputTokens: 20, totalTokens: 120, cachedInputTokens: 0, reasoningOutputTokens: 0 },
+      },
+    });
+    emit("thr_1", "thread/tokenUsage/updated", {
+      turnId: "turn_1",
+      tokenUsage: { last: { inputTokens: 100, outputTokens: 20, totalTokens: 120, cachedInputTokens: 0, reasoningOutputTokens: 0 } },
+    });
+    emit("thr_1", "turn/completed", { turn: { id: "turn_1", status: "completed" } });
+    assert.equal(await first, "Example Domain");
+    assert.equal(captions.at(-1), "checking the example page");
+    assert.deepEqual(
+      steps.map((s) => `${s.tool}: ${s.detail}`),
+      ["browser_navigate: opened https://example.com", `search: searched "example domain"`, "command: ran ls"],
+    );
+    const usage = store.getState().usage?.filter((e) => e.kind === "model.tokens" && e.source === "session") ?? [];
+    assert.equal(usage.length, 1, "the same turn's usage is recorded once");
+    assert.equal(usage[0].model, "gpt-6.1-sol");
+    assert.equal(usage[0].inputTokens, 100);
+    assert.equal(usage[0].outputTokens, 20);
+
+    const second = rt.turn({ thread, input: "And the heading under it?", effort: "medium", botId: "boppy", epoch: store.stateEpoch(), hooks: hooks() });
+    await tick();
+    assert.equal(of("thread/start").length, 1, "the reply stays on the thread");
+    assert.equal(of("turn/start").at(-1).params.threadId, "thr_1");
+    emit("thr_1", "thread/tokenUsage/updated", { turnId: "turn_2", tokenUsage: { last: { inputTokens: 100, outputTokens: 30 }, total: { inputTokens: 200, outputTokens: 50 } } });
+    emit("thr_1", "thread/tokenUsage/updated", { turnId: "turn_2", tokenUsage: { last: { inputTokens: 150, outputTokens: 50 }, total: { inputTokens: 350, outputTokens: 100 } } });
+    emit("thr_1", "thread/tokenUsage/updated", { turnId: "turn_2", tokenUsage: { last: { inputTokens: 150, outputTokens: 50 }, total: { inputTokens: 350, outputTokens: 100 } } });
+    emit("thr_1", "item/completed", { item: { id: "msg2", type: "agentMessage", text: "Example Domain, still." } });
+    emit("thr_1", "turn/completed", { turn: { id: "turn_2", status: "completed" } });
+    assert.equal(await second, "Example Domain, still.");
+    const entries = store.getState().usage.filter((e) => e.kind === "model.tokens" && e.source === "session");
+    assert.equal(entries.length, 3, "each distinct inference counted, duplicate snapshot ignored");
+    assert.equal(entries.reduce((n, e) => n + e.inputTokens, 0), 350);
+    assert.equal(entries.reduce((n, e) => n + e.outputTokens, 0), 100);
+    const restored = await rt.open(macOpen({ resume: { id: thread.id, tokens: thread.tokens } }));
+    const third = rt.turn({ thread: restored, input: "After restarting?", effort: "medium", botId: "boppy", epoch: store.stateEpoch(), hooks: hooks() });
+    await tick();
+    emit(thread.id, "thread/tokenUsage/updated", { tokenUsage: { last: { inputTokens: 50, outputTokens: 10 }, total: { inputTokens: 400, outputTokens: 110 } } });
+    emit(thread.id, "item/completed", { item: { id: "msg3", type: "agentMessage", text: "Same thread" } });
+    emit(thread.id, "turn/completed", { turn: { status: "completed" } });
+    assert.equal(await third, "Same thread");
+    assert.equal(store.getState().usage.filter((e) => e.kind === "model.tokens" && e.source === "session").reduce((n, e) => n + e.inputTokens, 0), 400, "resume counts only fresh tokens");
+    await rt.close(restored);
+
+    console.log("codex mac -> steps, caption, answer, second turn, tokens");
+  } finally {
+    await rt.close(thread);
+  }
+}
+
+/* ---------------- Stop ---------------- */
+
+{
+  const rt = tasks.tasksRuntime();
+  const thread = await rt.open(macOpen());
+  try {
+    let stop = () => {};
+    const pending = rt.turn({
+      thread,
+      input: "Keep going forever.",
+      effort: "low",
+      botId: "boppy",
+      epoch: store.stateEpoch(),
+      hooks: { step() {}, caption() {}, isStopped: () => false, bindStop: (fn) => (stop = fn) },
+    });
+    await tick();
+    stop();
+    await tick();
+    const hit = of("turn/interrupt").at(-1);
+    assert.equal(hit?.params.threadId, thread.id);
+    assert.equal(hit?.params.turnId, `turn_${of("turn/start").length}`);
+    emit(thread.id, "turn/completed", { turn: { status: "interrupted" } });
+    await assert.rejects(pending, { message: "Stopped by you" });
+    console.log("stop -> turn/interrupt, Stopped by you");
+  } finally {
+    await rt.close(thread);
+  }
+}
+
+/* ---------------- Resume after the server restarted ---------------- */
+
+{
+  const rt = tasks.tasksRuntime();
+  const again = await rt.open(macOpen({ resume: { id: "thr_saved" } }));
+  try {
+    assert.equal(again.id, "thr_saved");
+    const resumed = of("thread/resume").at(-1).params;
+    assert.equal(resumed.threadId, "thr_saved");
+    assert.equal(resumed.developerInstructions, instructions);
+    assert.equal(resumed.config.web_search, "live");
+    assert.deepEqual(resumed.config.mcp_servers.browser, local.browserServer(9300, workspace));
+    assert.equal(of("thread/start").length, 2, "a saved thread is resumed, not started over");
+    console.log("resume -> thread/resume keeps the browser and the instructions");
+  } finally {
+    await rt.close(again);
+  }
+}
+
+/* ---------------- Cloud computer, and no ChatGPT sign-in ---------------- */
+
+{
+  const rt = tasks.tasksRuntime();
+  const before = calls.length;
+  await assert.rejects(() => rt.open({ instructions, effort: "medium", place: orgoPlace, botId: "boppy" }), (e) => /BOPS_TASK_RUNTIME=openai/.test(e.message) && !(e instanceof CodexLimitError));
+  assert.equal(calls.length, before, "no thread was started for a cloud computer");
+  rmSync(authPath);
+  await assert.rejects(() => rt.open(macOpen()), (e) => e instanceof CodexSignInError && /Settings → This Mac/.test(e.message));
+  assert.equal(calls.length, before, "signed out: the app-server wasn't asked");
+  signIn();
+  console.log("orgo -> refused, use BOPS_TASK_RUNTIME=openai; signed out -> Settings → This Mac");
+}
+
+/* ---------------- The plan's limit ---------------- */
+
+{
+  const rt = tasks.tasksRuntime();
+  const thread = await rt.open(macOpen());
+  try {
+    const pending = rt.turn({ thread, input: "Do the long one.", effort: "high", botId: "boppy", epoch: store.stateEpoch(), hooks: { step() {}, caption() {}, isStopped: () => false, bindStop() {} } });
+    await tick();
+    assert.equal(of("turn/start").at(-1).params.model, "gpt-6-astra", "high effort uses the hard model");
+    emit(thread.id, "turn/completed", { turn: { status: "failed", error: { message: "The usage limit has been reached", code: "usage_limit_reached" } } });
+    const error = await pending.then(
+      () => assert.fail("the limit came back as an answer"),
+      (e) => e,
+    );
+    assert.ok(error instanceof CodexLimitError, error?.message);
+    assert.match(error.message, /your ChatGPT Pro plan/);
+    assert.equal(cloud.noteOutOfCredit(error), true);
+    assert.equal(cloud.creditNote(error), error.message);
+    assert.equal(store.getState().credits, undefined, "not Bops Cloud's credit");
+    console.log("limit ->", error.message);
+  } finally {
+    await rt.close(thread);
+  }
+}
+
+/* ---------------- Bops Cloud's AI credit gates only the OpenAI runtime ---------------- */
+
+{
+  process.env.BOPS_SELF_HOSTED = "0";
+  globalThis.bopsOrgoKey = "orgo-test-not-a-real-key";
+  store.update((s) => (s.credits = { out: true, at: Date.now() }));
+  process.env.BOPS_RUNTIME = "codex";
+  delete process.env.BOPS_TASK_RUNTIME;
+  assert.equal(await tasks.tasksOutOfCredit(), false, "the plan isn't Bops Cloud's credit");
+  process.env.BOPS_TASK_RUNTIME = "openai";
+  assert.equal(await tasks.tasksOutOfCredit(), true, "openai through the cloud still pauses");
+  store.update((s) => (s.credits = undefined));
+  globalThis.bopsOrgoKey = null;
+  process.env.BOPS_SELF_HOSTED = "1";
+  delete process.env.BOPS_TASK_RUNTIME;
+  process.env.BOPS_RUNTIME = "codex";
+  console.log("cloud credit -> codex tasks go on, openai through the cloud pauses");
+}
+
+/* ---------------- OpenAI's Agents API, unchanged ---------------- */
+
+{
+  process.env.BOPS_TASK_RUNTIME = "openai";
+  const before = calls.length;
+  const rt = tasks.tasksRuntime();
+  const mac = await rt.open(macOpen());
+  try {
+    const body = agentBodies.at(-1);
+    assert.equal(body.agent.model, "gpt-6.1-sol");
+    assert.deepEqual(body.agent.reasoning, { effort: "medium", summary: "auto" });
+    assert.equal(body.agent.instructions, instructions);
+    assert.equal(body.agent.tools[0].type, "web_search");
+    assert.equal(body.agent.tools[0].mode, "live");
+    assert.equal(body.agent.tools.length, 2, "web search and the browser, no screen tools");
+    assert.equal(body.agent.tools[1].server_label, "browser");
+    assert.equal(body.agent.tools[1].required, true);
+    assert.deepEqual(body.agent.tools[1].transport, local.browserMcp(9300));
+    assert.equal(body.agent.multi_agent, undefined);
+    assert.equal(body.environment.type, "self_hosted");
+    assert.equal(body.environment.workspace_directory, workspace);
+    assert.equal(mac.env?.id, "env_1");
+    const steps = [], captions = [];
+    const answer = await rt.turn({ thread: mac, input: "Read the example", effort: "medium", botId: "boppy", epoch: store.stateEpoch(), hooks: { step: (tool, detail) => steps.push({ tool, detail }), caption: (line) => captions.push(line), isStopped: () => false, bindStop() {} } });
+    assert.equal(answer, "OpenAI Example Domain");
+    assert.deepEqual(steps, [{ tool: "browser_navigate", detail: "opened https://example.com" }]);
+    assert.equal(captions.at(-1), "checking the page");
+    assert.deepEqual(agentInputs.at(-1), { events: [{ type: "agent.session.input.message", input: [{ role: "user", content: [{ type: "input_text", text: "Read the example" }] }] }] });
+
+  } finally {
+    await rt.close(mac);
+  }
+  const cloudThread = await rt.open({ instructions, effort: "high", place: orgoPlace, botId: "boppy" });
+  try {
+    const body = agentBodies.at(-1);
+    assert.equal(body.agent.model, "gpt-6-astra");
+    assert.deepEqual(body.agent.reasoning, { effort: "high", summary: "auto" });
+    assert.equal(body.agent.tools.length, 3);
+    assert.equal(body.agent.tools[1].server_label, "browser");
+    assert.equal(body.agent.tools[1].required, false);
+    assert.ok(body.agent.tools[1].transport.args.includes("http://127.0.0.1:9300"));
+    assert.equal(body.agent.tools[2].server_label, "screen");
+    assert.equal(body.agent.tools[2].required, true);
+    assert.deepEqual(body.agent.tools[2].transport.args, ["/opt/bops/screen_mcp.py", "stdio", "--session", "ses_test", "--bot", "boppy"]);
+    assert.deepEqual(body.agent.multi_agent, { enabled: true, max_concurrent_subagents: 3 });
+    assert.equal(body.environment.workspace_directory, "/workspace");
+    assert.ok(cloudThread.env?.remoteUrl);
+  } finally {
+    await rt.close(cloudThread);
+  }
+  assert.equal(calls.length, before, "openai doesn't start a Codex thread");
+  console.log("openai -> Agents session unchanged (mac browser, orgo helpers)");
+}
+
+// Your Mac shares the adapter while preserving native app approvals.
+{
+  const rt = tasks.macTasksRuntime();
+  const thread = await rt.open(macOpen({ native: true }));
+  const params = of("thread/start").at(-1).params;
+  assert.equal(params.approvalPolicy, "on-request");
+  assert.equal(params.approvalsReviewer, "user");
+  assert.equal(params.sandbox, "read-only");
+  assert.equal(params.config.mcp_servers, undefined, "no bot browser on Your Mac");
+  const targets = [];
+  const pending = rt.turn({ thread, input: "Use Calculator", effort: "medium", botId: "boppy", epoch: store.stateEpoch(), hooks: { step() {}, caption() {}, isStopped: () => false, bindStop() {}, computer: (apps, target) => targets.push({ apps, target }) } });
+  await tick();
+  emit(thread.id, "item/started", { item: { id: "native", type: "mcpToolCall", server: "cua_repl", tool: "js", arguments: { code: 'await cua.getApp("Calculator")', title: "Open Calculator" } } });
+  emit(thread.id, "item/completed", { item: { id: "native_answer", type: "agentMessage", text: "4" } });
+  emit(thread.id, "turn/completed", { turn: { status: "completed" } });
+  assert.equal(await pending, "4");
+  assert.deepEqual(targets[0].apps, ["Calculator"]);
+  await rt.close(thread);
+  console.log("Your Mac -> native approvals, app targets, answer through the task interface");
+}
+
+// Stopping before turn/start responds, including a terminal event before that response.
+for (const completesEarly of [false, true]) {
+  const rt = tasks.macTasksRuntime();
+  const thread = await rt.open(macOpen());
+  let stop;
+  holdNextTurn = true;
+  const pending = rt.turn({ thread, input: "Wait", effort: "medium", botId: "boppy", epoch: store.stateEpoch(), hooks: { step() {}, caption() {}, isStopped: () => false, bindStop: (fn) => stop = fn } });
+  const result = pending.then(() => "unexpected success", (e) => e.message);
+  await tick();
+  const before = of("turn/interrupt").length;
+  stop();
+  assert.equal(of("turn/interrupt").length, before, "waits for the turn id");
+  if (completesEarly) emit(thread.id, "turn/completed", { turn: { status: "interrupted" } });
+  heldTurn({ turn: { id: "late_turn" } });
+  await tick();
+  assert.equal(of("turn/interrupt").at(-1).params.turnId, "late_turn");
+  if (!completesEarly) emit(thread.id, "turn/completed", { turn: { status: "interrupted" } });
+  assert.equal(await result, "Stopped by you");
+  await rt.close(thread);
+}
+console.log("stop race -> queued interrupt delivered after a late turn id, no stale listener");
+
+console.log("all runtime task tests passed (fake app-server, fake Agents API, none to the network)");
+fake.close();
+rmSync(scratch, { recursive: true, force: true });
+process.exit(0);
