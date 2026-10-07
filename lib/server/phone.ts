@@ -1,4 +1,5 @@
 import "server-only";
+import { requireSipVoice } from "./runtime/voice/index";
 import { openaiClient } from "./openai-client";
 import { SidebandWS } from "openai/resources/live/sideband/ws";
 import type { LiveTransportIncomingWebhookEvent } from "openai/resources/webhooks";
@@ -696,6 +697,7 @@ const header = (e: LiveTransportIncomingWebhookEvent, name: string) =>
  * up as the in-app call is, then run the call from here over the sideband.
  */
 export async function incomingCall(e: LiveTransportIncomingWebhookEvent, verdict?: CallerVerdict) {
+  requireSipVoice();
   const sessionId = e.data.session_id;
   if (state.calls.has(sessionId)) return;
   state.calls.add(sessionId);
