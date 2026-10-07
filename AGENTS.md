@@ -72,7 +72,7 @@ Roteiro de verificação real (lido por `to-execute`):
 1. **Isolamento:** rodar a partir de um checkout/worktree próprio (o `.data/` dele é o sandbox) numa porta livre diferente de 3210, que é a instância de uso do dono. `.env.local` próprio no checkout de teste, copiado do principal. Registrar `shasum -a 256` de `<checkout principal>/.data/state.json` antes e depois: deve ficar inalterado. `~/.bops/` e o Keychain são compartilhados; usar só bots/dados criados pelo teste. `git check-ignore -q .tmp/` precisa passar.
 2. **Launch:** `npx next dev --port <porta>` no checkout de teste. Readiness: `curl -s http://127.0.0.1:<porta>/api/health` devolve `{"bops":true}`.
 3. **Doctor (read-only):** `curl -s http://127.0.0.1:<porta>/api/auth/status` devolve `"needsSignIn":false` em self-hosting; `codex login status` informa o login usado pelo runtime Codex; `/api/state` → `mac.next` não é `codex` (app-server subiu).
-4. **Ação:** pelo navegador real em `http://127.0.0.1:<porta>`. Exemplo: mandar mensagem ao Boppy pelo campo "Text Boppy" e esperar a resposta na conversa.
+4. **Ação:** pelo navegador real em `http://localhost:<porta>` (não `127.0.0.1`: o `next dev` bloqueia esse origin para os recursos de dev e a página fica em "Loading Bops…"). Exemplo: mandar mensagem ao Boppy pelo campo "Text Boppy" e esperar a resposta na conversa.
 5. **Observável e efeitos:** a resposta aparece na UI **e** persiste em `<checkout de teste>/.data/state.json` (`messages` do chat).
 6. **Evidência:** `.tmp/verify/<ticket>/<item>/evidence.md`, com comando, saída literal e digest de cada anexo.
 7. **Cleanup:** encerrar só os PIDs iniciados pelo teste; nunca apagar evidência.
