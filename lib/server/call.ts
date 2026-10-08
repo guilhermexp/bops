@@ -2,14 +2,13 @@ import "server-only";
 import { computerBriefing, teamBriefing } from "./briefing";
 import { ABOUT_BOPS, SPEAKING } from "./style";
 import { appsNote, placesNote } from "./skills";
-import { openaiClient } from "./openai-client";
+import { answerVoice } from "./runtime/voice/index";
+export { voiceFor, rememberVoices } from "./runtime/voice/index";
 import { botChatId, live, type Bot } from "@/lib/types";
 import { handleMessage } from "./chat";
 import { callEnded, callStarted } from "./attention";
-import { noteOutOfCredit, OUT_OF_CREDIT } from "./cloud";
-import { chose, decide } from "./decide";
 import { memoryBlock, saveToMemory, wsOf } from "./memory";
-import { addMessage, bot, getState, ownerLine, ownerName, update } from "./store";
+import { addMessage, bot, getState, ownerLine, ownerName } from "./store";
 import { recordCallMinutes } from "./usage";
 import { contactLine } from "./bots";
 
@@ -19,50 +18,6 @@ import { contactLine } from "./bots";
  * a call the bot can start threads on its computer, hand work to teammates and schedule things,
  * exactly as it would over text. What gets done shows up in its chat like any other message.
  */
-
-const client = openaiClient({ maxRetries: 0 });
-
-/**
- * Each bot sounds like itself, in a voice that fits its name: a woman's voice for a woman's name, a
- * man's for a man's, and a man's when the name could be either or isn't a name (Jev decides, once
- * per name). Within that, the bot's id picks the voice, so it's the same on every call.
- */
-const MALE = ["cedar", "ash", "echo", "ballad", "verse"];
-const FEMALE = ["marin", "coral", "shimmer", "sage"];
-const genders = new Map<string, "female" | "male">();
-export async function voiceFor(b: Bot) {
-  const voice = await chooseVoice(b);
-  // Kept on the bot, so Bops Cloud answers its calls in the same voice while the Mac is away.
-  if (b.voice !== voice) update(() => void (b.voice = voice));
-  return voice;
-}
-
-/** Every bot's voice, chosen and kept (the phone's catch-up runs it): a new or renamed bot gets its own before its first call. */
-export async function rememberVoices() {
-  for (const b of getState().bots) await voiceFor(b);
-}
-
-async function chooseVoice(b: Bot) {
-  if (b.isMain && (b.name === "Boppy" || b.name === "Sam")) return "cedar";
-  let g = genders.get(b.name);
-  if (!g) {
-    const a = await decide(
-      { name: b.name },
-      {
-        gender: {
-          type: "choice",
-          instructions: `As a person's first name, is "${b.name}" usually a woman's name or a man's name?`,
-          criteria: { female: "Usually a woman's name", male: "Usually a man's name", unclear: "Could be either, or not a person's name" },
-        },
-      },
-    );
-    const c = chose(a?.gender);
-    g = c?.choice === "female" && (c.probabilities.female ?? 0) >= 0.6 ? "female" : "male";
-    if (c) genders.set(b.name, g);
-  }
-  const list = g === "female" ? FEMALE : MALE;
-  return list[[...b.id].reduce((n, ch) => n + ch.charCodeAt(0), 0) % list.length];
-}
 
 /**
  * What the bot is told on a call with the user. "live": a GPT-Live call (in the app, or over a SIP
@@ -111,18 +66,10 @@ export async function startCall(botId: string, sdp: string) {
   if (!b) throw new Error("no such bot");
   callStarted(botId);
   try {
-    const result = await client.live.create({
-      session: {
-        model: "gpt-live-1",
-        instructions: await voicePrompt(b),
-        audio: { output: { voice: await voiceFor(b) } },
-        delegation: { type: "client" },
-      },
-      transport: { type: "webrtc", sdp },
-    } as never);
-    return result as unknown as { session: { id: string }; transport: { sdp: string } };
+    const result = await answerVoice(b, sdp, await voicePrompt(b));
+    return { session: { id: result.sessionId }, transport: { sdp: result.sdp }, client: result.client };
   } catch (e) {
-    if (noteOutOfCredit(e)) throw new Error(OUT_OF_CREDIT);
+    callEnded();
     throw e;
   }
 }
@@ -155,4 +102,6 @@ export function endCall(botId: string, seconds: number, transcript?: { who: stri
   const m = Math.floor(seconds / 60);
   const s = Math.round(seconds % 60);
   addMessage({ chatId: botChatId(botId), role: "system", text: `${phone ? "Phone call" : "Call"} ended · ${m ? `${m}m ` : ""}${s}s`, call: { seconds: Math.round(seconds), phone } });
+  // Call cards show only duration; a separate note makes the words visible in the chat too.
+  if (transcript?.length) addMessage({ chatId: botChatId(botId), role: "system", text: ["Call transcript", ...transcript.slice(-200).map((t) => `${t.who === "owner" ? ownerName() : bot(botId)?.name ?? "Bot"}: ${t.text.slice(0, 2000)}`)].join("\n") });
 }

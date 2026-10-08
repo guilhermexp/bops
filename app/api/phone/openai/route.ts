@@ -1,3 +1,4 @@
+import { requireSipVoice } from "@/lib/server/runtime/voice/index";
 import { CLOUD_CALLER_HEADER } from "@/cloud/protocol";
 import { fromCloudTunnel } from "@/lib/server/cloud-tunnel";
 import { openaiClient } from "@/lib/server/openai-client";
@@ -21,6 +22,7 @@ const client = openaiClient({ maxRetries: 0 });
 type WebhookEvent = Awaited<ReturnType<typeof client.webhooks.unwrap>>;
 
 export async function POST(request: Request) {
+  try { requireSipVoice(); } catch (e) { return Response.json({ error: (e as Error).message }, { status: 409 }); }
   const body = await request.text();
   let event: WebhookEvent;
   const tunnel = fromCloudTunnel(request);

@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { channelMessage } from "@/lib/server/runtime/voice/channel";
+import type { VoiceClient, VoiceControl, VoiceEvent } from "@/lib/server/runtime/voice/types";
 import type { Bot } from "@/lib/types";
 import { Mascot } from "./mascot";
 
@@ -124,14 +126,37 @@ export function CallBar({ bot: b, owner, onClose, compact, onOpen }: { bot: Bot;
     else transcript.current.push({ who, text: delta });
   };
   const closed = useRef(false);
+  const serverCall = useRef<string | null>(null);
+  const recorded = useRef(false);
+  const recordEnd = useCallback(() => {
+    if (!startedAt.current || recorded.current) return;
+    recorded.current = true;
+    void fetch("/api/call", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "end", botId: b.id, seconds: (Date.now() - startedAt.current) / 1000, transcript: transcript.current.map((t) => ({ ...t, text: t.text.trim() })).filter((t) => t.text) }) });
+  }, [b.id]);
 
   useEffect(() => {
     let gone = false;
-    const send = (event: object) => events.current?.readyState === "open" && events.current.send(JSON.stringify(event));
+    let client: VoiceClient | undefined;
+    let pollTimer: ReturnType<typeof setTimeout> | undefined;
+    const send = (event: VoiceControl) => {
+      if (gone || closed.current) return;
+      if (client?.transport === "server") {
+        void fetch("/api/call", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: event.type === "session.close" ? "close" : "speak", callId: client.callId, content: event.content, delegationId: event.delegation_id, complete: event.complete }) }).then(async (res) => {
+          if (!res.ok) throw new Error((await res.json()).error ?? "The call stopped.");
+        }).catch((e: Error) => {
+          if (!gone && !closed.current) {
+            closed.current = true;
+            if (client?.transport === "server") void fetch("/api/call", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "close", callId: client.callId }) });
+            setError(e.message); setPhase("failed"); recordEnd(); cleanup();
+          }
+        });
+      } else if (events.current?.readyState === "open") events.current.send(JSON.stringify(channelMessage(client?.transport === "data-channel" ? client : undefined, event)));
+    };
 
     // This attempt's own connection, so cleaning up never touches a newer attempt's (React may mount twice).
     let mine: { pc?: RTCPeerConnection; channel?: RTCDataChannel; stream?: MediaStream; ctx?: AudioContext } = {};
     const cleanup = () => {
+      clearTimeout(pollTimer);
       mine.stream?.getTracks().forEach((t) => t.stop());
       mine.channel?.close();
       mine.pc?.close();
@@ -152,31 +177,34 @@ export function CallBar({ bot: b, owner, onClose, compact, onOpen }: { bot: Bot;
     const followUp = async (delegationId: string, sessionId: string) => {
       for (let i = 0; i < 120 && !gone && !closed.current; i++) {
         await new Promise((r) => setTimeout(r, 3000));
+        if (gone || closed.current) return;
         const state = (await (await fetch("/api/state", { cache: "no-store" })).json()) as { state: { sessions: { id: string; title: string; status: string; answer?: string; error?: string }[] } };
         const t = state.state.sessions.find((x) => x.id === sessionId);
         if (!t || t.status === "queued" || t.status === "starting" || t.status === "running") continue;
         send({
           type: "session.commentary.append",
           delegation_id: delegationId,
-          content: t.status === "done" ? `"${t.title}" is done: ${t.answer ?? "finished"}` : `"${t.title}" didn't finish: ${t.error ?? "it stopped"}`,
+          complete: true, content: t.status === "done" ? `"${t.title}" is done: ${t.answer ?? "finished"}` : `"${t.title}" didn't finish: ${t.error ?? "it stopped"}`,
         });
         return;
       }
     };
 
     /** The user asked for something to be done: run it as the bot, then hand back what to say. */
-    const onDelegation = async (delegationId: string) => {
-      const request = heard.current.trim();
+    const onDelegation = async (delegationId: string, asked?: string) => {
+      const request = asked?.trim() || heard.current.trim();
       heard.current = "";
       setWorking(true);
+      if (client?.transport === "server") send({ type: "session.commentary.append", delegation_id: delegationId, content: "Your chat teammate is working on this request." });
       try {
         const res = await fetch("/api/call", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "delegate", botId: b.id, request }) });
         const json = (await res.json()) as { result?: string; sessionIds?: string[]; error?: string };
-        send({ type: "session.commentary.append", delegation_id: delegationId, content: json.result ?? `That didn't work: ${json.error ?? "something went wrong"}.` });
+        if (gone || closed.current) return;
+        send({ type: "session.commentary.append", delegation_id: delegationId, complete: true, content: json.result ?? `That didn't work: ${json.error ?? "something went wrong"}.` });
         // Work it started keeps going on the computer; if it finishes during the call, say how it went.
         for (const id of json.sessionIds ?? []) void followUp(delegationId, id);
       } catch {
-        send({ type: "session.commentary.append", delegation_id: delegationId, content: "I couldn't reach my computer just now." });
+        send({ type: "session.commentary.append", delegation_id: delegationId, complete: true, content: "I couldn't reach my computer just now." });
       } finally {
         setWorking(false);
       }
@@ -209,38 +237,58 @@ export function CallBar({ bot: b, owner, onClose, compact, onOpen }: { bot: Bot;
         const channel = pc.createDataChannel("oai-events");
         events.current = channel;
         mine.channel = channel;
-        channel.addEventListener("message", ({ data }) => {
-          const event = JSON.parse(String(data)) as { type: string; delta?: string; delegation?: { id: string; target?: string } };
-          if (event.type === "session.started") {
+        const turns = new Map<string, number>();
+        const handle = (event: VoiceEvent) => {
+          if (gone || closed.current) return;
+          if (event.kind === "started") {
+            if (startedAt.current) return;
             hush();
             startedAt.current = Date.now();
             setPhase("live");
-            // The bot speaks first, the way anyone picks up a call.
             send({ type: "session.commentary.append", delegation_id: null, content: `You just picked up the call. Say only: "Hello? Can you hear me?" Then wait for ${ownerRef.current?.trim() || "the user"}.` });
-          } else if (event.type === "session.closed") {
+          } else if (event.kind === "closed" || event.kind === "error") {
+            if (client?.transport === "server") void fetch("/api/call", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "close", callId: client.callId }) });
             closed.current = true;
+            hush();
+            recordEnd();
             if (startedAt.current) endTone();
-            setPhase("ended");
+            if (event.kind === "error") { setError(event.message); setPhase("failed"); }
+            else setPhase("ended");
             cleanup();
-          } else if (event.type === "session.input_transcript.delta" && event.delta) {
-            turn("owner", event.delta);
+          } else if (event.kind === "input") {
+            if (event.text !== undefined && event.turn !== undefined) {
+              const key = `input:${event.turn}`;
+              let index = turns.get(key);
+              if (index === undefined) { index = transcript.current.length; turns.set(key, index); transcript.current.push({ who: "owner", text: event.text }); }
+              else transcript.current[index].text = event.text;
+            } else turn("owner", event.delta);
             if (said.current) said.current = "";
-            heard.current += event.delta;
+            heard.current = event.text ?? heard.current + event.delta;
             setCaption({ who: "you", text: heard.current.trim() });
-          } else if (event.type === "session.output_transcript.delta" && event.delta) {
-            turn("bot", event.delta);
-            said.current += event.delta;
+          } else if (event.kind === "output") {
+            if (event.text !== undefined && event.turn !== undefined) {
+              const key = `output:${event.turn}`;
+              let index = turns.get(key);
+              if (index === undefined) { index = transcript.current.length; turns.set(key, index); transcript.current.push({ who: "bot", text: event.text }); }
+              else transcript.current[index].text = event.text;
+            } else turn("bot", event.delta);
+            said.current = event.text ?? said.current + event.delta;
             setCaption({ who: "bot", text: said.current.replace(/^[\s.,;:!?]+/, "").trim() });
-          } else if (event.type === "session.delegation.created" && event.delegation?.target === "client") {
-            void onDelegation(event.delegation.id);
-          }
+          } else if (event.kind === "delegation") void onDelegation(event.id, event.request);
+        };
+        channel.addEventListener("message", ({ data }) => {
+          if (client?.transport === "server") return;
+          let event;
+          try { event = JSON.parse(String(data)); } catch { return; }
+          const names = client?.transport === "data-channel" ? client : undefined;
+          if (event.type === (names?.started ?? "session.started")) handle({ kind: "started" });
+          else if (event.type === (names?.closed ?? "session.closed")) handle({ kind: "closed" });
+          else if (event.type === (names?.input ?? "session.input_transcript.delta") && event.delta) handle({ kind: "input", delta: event.delta });
+          else if (event.type === (names?.output ?? "session.output_transcript.delta") && event.delta) handle({ kind: "output", delta: event.delta });
+          else if (event.type === (names?.delegation ?? "session.delegation.created") && event.delegation?.target === "client") handle({ kind: "delegation", id: event.delegation.id, request: "" });
         });
         channel.addEventListener("close", () => {
-          if (!closed.current && !gone && events.current === channel) {
-            if (startedAt.current) endTone();
-            setPhase("ended");
-            cleanup();
-          }
+          if (!closed.current && !gone && events.current === channel) handle({ kind: "closed" });
         });
 
         const offer = await pc.createOffer();
@@ -262,15 +310,38 @@ export function CallBar({ bot: b, owner, onClose, compact, onOpen }: { bot: Bot;
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action: "start", botId: b.id, sdp: pc.localDescription?.sdp }),
         });
-        const json = (await res.json()) as { transport?: { sdp: string }; error?: string };
+        const json = (await res.json()) as { transport?: { sdp: string }; client?: VoiceClient; error?: string };
         if (!json.transport) throw new Error(json.error ?? "the call didn't connect");
-        if (gone) return;
+        client = json.client;
+        if (gone) {
+          if (client?.transport === "server") void fetch("/api/call", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "close", callId: client.callId }) });
+          return;
+        }
+        if (client?.transport === "server") serverCall.current = client.callId;
         await pc.setRemoteDescription({ type: "answer", sdp: json.transport.sdp });
+        if (client?.transport === "server") {
+          const callId = client.callId;
+          let cursor = 0;
+          const poll = async () => {
+            if (gone || closed.current) return;
+            try {
+              const res = await fetch(`/api/call?callId=${encodeURIComponent(callId)}&after=${cursor}`, { cache: "no-store" });
+              const result = await res.json() as { events?: VoiceEvent[]; cursor: number; error?: string };
+              if (!res.ok) throw new Error(result.error ?? "The call stopped.");
+              cursor = result.cursor;
+              for (const event of result.events ?? []) handle(event);
+              if (!gone && !closed.current) pollTimer = setTimeout(() => void poll(), 150);
+            } catch (e) { handle({ kind: "error", message: (e as Error).message }); }
+          };
+          void poll();
+        }
       } catch (e) {
         if (gone) return;
         hush();
         setError((e as Error).message.includes("Permission") ? "Bops needs microphone access for calls." : (e as Error).message);
         setPhase("failed");
+        if (serverCall.current) void fetch("/api/call", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "close", callId: serverCall.current }) });
+        recordEnd();
         cleanup();
       }
     })();
@@ -278,10 +349,12 @@ export function CallBar({ bot: b, owner, onClose, compact, onOpen }: { bot: Bot;
     return () => {
       gone = true;
       hush();
-      if (!closed.current && mine.channel?.readyState === "open") mine.channel.send(JSON.stringify({ type: "session.close" }));
+      recordEnd();
+      if (client?.transport === "server") void fetch("/api/call", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "close", callId: client.callId }) });
+      else if (!closed.current && mine.channel?.readyState === "open") mine.channel.send(JSON.stringify({ type: "session.close" }));
       setTimeout(cleanup, 300);
     };
-  }, [b.id]);
+  }, [b.id, recordEnd]);
 
   // The waveform: every ~90ms, how loud the call is right now (whoever is talking) becomes the newest dot.
   useEffect(() => {
@@ -318,7 +391,14 @@ export function CallBar({ bot: b, owner, onClose, compact, onOpen }: { bot: Bot;
 
   const hangUp = () => {
     if (startedAt.current) endTone();
-    if (startedAt.current) void fetch("/api/call", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "end", botId: b.id, seconds, transcript: transcript.current.map((t) => ({ ...t, text: t.text.trim() })).filter((t) => t.text) }) });
+    recordEnd();
+    if (serverCall.current) {
+      closed.current = true;
+      setPhase("ending");
+      void fetch("/api/call", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "close", callId: serverCall.current }) });
+      setTimeout(onClose, 600);
+      return;
+    }
     if (events.current?.readyState === "open" && !closed.current) {
       setPhase("ending");
       events.current.send(JSON.stringify({ type: "session.close" }));
