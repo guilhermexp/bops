@@ -66,9 +66,9 @@ Test Coverage Matrix:
 | Camada / path | Tier | Como rodar |
 |---|---|---|
 | `lib/server/phone-voice.ts`, `app/api/phone/agentphone` | integração com OpenAI/backend Codex/AgentPhone falsos (runtimes openai e codex) | `node --conditions=react-server scripts/test-phone-voice.mjs` |
-| `lib/server/runtime/text/**`, `lib/server/runtime/codex/**`, chamadores de texto (`chat.ts`, `memory.ts`, `watches.ts`, `sessions.ts` `suggestReplies`), `lib/server/codex.ts` (app-server sobe na config do usuário) | integração com backend Codex/OpenAI falsos, `CODEX_HOME` temporário; Codex CLI real sem rede | `node --conditions=react-server scripts/test-runtime-text.mjs` |
-| `lib/server/runtime/tasks/**`, `sessions.ts` (tarefas) | integração com singleton app-server e Agents API falsos, workspace/estado temporários; inclui ciclo da sessão/chat e regressões de allowlist MCP, sandbox herdado, limite estruturado e narração nativa | `node --conditions=react-server scripts/test-runtime-tasks.mjs` |
-| `lib/server/runtime/voice/**`, `lib/server/call.ts`, `/api/call`, CallBar, guarda SIP | integração com sinalização/sideband/texto falsos em localhost; chamada real isolada com WAV | `node --conditions=react-server scripts/test-runtime-voice.mjs` · roteiro de verificação real |
+| `lib/server/runtime/text/**`, `lib/server/runtime/codex/**`, chamadores de texto (`chat.ts`, `memory.ts`, `watches.ts`, `sessions.ts` `suggestReplies`), `lib/server/codex.ts` (app-server sobe na config do usuário) | integração com backend Codex/OpenAI falsos, `CODEX_HOME` temporário; Codex CLI real sem rede; runtime extra de teste responde texto e recusa capacidades ausentes | `node --conditions=react-server scripts/test-runtime-text.mjs` |
+| `lib/server/runtime/tasks/**`, `sessions.ts` (tarefas) | integração com singleton app-server e Agents API falsos, workspace/estado temporários; inclui ciclo da sessão/chat e regressões de allowlist MCP, sandbox herdado, limite estruturado e narração nativa, estado opaco de runtime extra, pinning e leitura de legado | `node --conditions=react-server scripts/test-runtime-tasks.mjs` |
+| `lib/server/runtime/voice/**`, `lib/server/call.ts`, `/api/call`, CallBar, guarda SIP | integração com sinalização/sideband/texto falsos em localhost; chamada real isolada com WAV; escolha de voz pertencente a runtime extra de teste | `node --conditions=react-server scripts/test-runtime-voice.mjs` · roteiro de verificação real |
 | `lib/server/**` demais | typecheck + lint | `npx tsc --noEmit -p .` · `npm run lint` |
 | fluxo do app | e2e real | roteiro abaixo |
 

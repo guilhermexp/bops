@@ -8,20 +8,24 @@ import { bot, patchSession, session, stateEpoch } from "../../store";
 import { workComputer } from "../../screens";
 import { DISPLAYS } from "@/lib/types";
 import { recordTokens } from "../../usage";
-import { taskModel, type TasksRuntime, type TaskThread, type TaskTurn, type TaskPlace, type TaskHooks } from "./types";
+import { taskModel, type TasksRuntime, type TaskTurn, type TaskPlace, type TaskHooks } from "./types";
 
 const client = openaiClient();
 const TURN_TIMEOUT_MS = 10 * 60_000;
-type OpenThread = TaskThread & { place: TaskPlace; executor?: ChildProcess; seen: Set<string> };
+type OpenState = { id: string; env: { id: string; remoteUrl: string } };
+type OpenThread = OpenState & { place: TaskPlace; executor?: ChildProcess; seen: Set<string> };
 
 export const openaiTasks: TasksRuntime = {
+  releaseScreens: true,
+  resume(session) { return session.taskState !== undefined ? session.taskState : (session.agentSessionId && session.env ? { id: session.agentSessionId, env: session.env } : undefined); },
+  snapshot(thread) { const { id, env } = thread as OpenThread; return { id, env }; },
   assertHost() {},
   outOfCredit: creditsOut,
   async open(req) {
     const { place } = req;
     const mac = place.host === "mac";
     const workspace = place.workspace;
-    let thread = req.resume;
+    let thread = req.resume as OpenState | undefined;
     if (!thread) {
       const created = await client.beta.agents.sessions.create({
         agent: {
@@ -66,7 +70,7 @@ export const openaiTasks: TasksRuntime = {
     opened.executor?.kill();
     if (opened.place.host === "orgo") {
       const { computerId, display } = opened.place;
-      await orgo.bash(computerId, `pkill -f "[e]nvironment-id ${thread.env!.id}"; rm -f /root/.bops/executor-key-${display}`, 15).catch(() => {});
+      await orgo.bash(computerId, `pkill -f "[e]nvironment-id ${opened.env.id}"; rm -f /root/.bops/executor-key-${display}`, 15).catch(() => {});
     }
   },
 };

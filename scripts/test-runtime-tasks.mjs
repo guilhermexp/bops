@@ -7,7 +7,7 @@
 // temporary folder. Nothing reaches the network.
 // Usage: node --conditions=react-server scripts/test-runtime-tasks.mjs
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { registerHooks, stripTypeScriptTypes } from "node:module";
@@ -80,6 +80,29 @@ globalThis.__bopsTestCodex = {
 const emit = (threadId, method, params = {}) => listeners.get(threadId)?.({ method, params: { threadId, ...params } });
 
 const root = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+// A third runtime exists only in this process. Its continuation is deliberately unlike either provider's.
+const fixtureOpens = [];
+globalThis.__bopsFixtureTasks = {
+  releaseScreens: true,
+  assertHost() {},
+  outOfCredit: async () => false,
+  resume: (session) => session.taskState,
+  snapshot: (thread) => thread.saved,
+  open: async (req) => {
+    fixtureOpens.push(req.resume);
+    const thread = { id: "fixture_handle", saved: req.resume ?? { cursor: { page: "first", revision: 0 } } };
+    req.opened?.(thread);
+    return thread;
+  },
+  turn: async ({ thread, hooks }) => {
+    thread.saved = { cursor: { page: "next", revision: thread.saved.cursor.revision + 1 } };
+    hooks.saveState?.(thread.saved);
+    return `Fixture revision ${thread.saved.cursor.revision}`;
+  },
+  close: async () => {},
+};
+const orgoCommands = [];
+globalThis.__bopsOrgoCommands = orgoCommands;
 const STAND_INS = new Set(["codex", "orgo", "relay", "desktop", "mirror", "memory", "decide", "briefing", "screen-watch", "attention", "mail", "phone", "channels", "skills", "plan", "tailnet", "vault"]);
 registerHooks({
   resolve(specifier, context, next) {
@@ -96,6 +119,19 @@ registerHooks({
     }
   },
   load(url, context, next) {
+    if (url.endsWith("/lib/server/codex.ts?approval-contract")) {
+      // Exercise the real approval router, without its startup or periodic process checks.
+      const source = readFileSync(new URL(url), "utf8").replace(/g\.__bopsMacCheck \?\?=[\s\S]*$/, "");
+      return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source) };
+    }
+    if (url.endsWith("/runtime/config.ts")) {
+      const source = readFileSync(new URL(url), "utf8").replace('["openai", "codex"] as const', '["openai", "codex", "fixture"] as const');
+      return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source) };
+    }
+    if (url.endsWith("/runtime/tasks/index.ts")) {
+      const source = readFileSync(new URL(url), "utf8").replace('codex: codexTasks }', 'codex: codexTasks, fixture: globalThis.__bopsFixtureTasks }');
+      return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source) };
+    }
     if (url.endsWith("/lib/server/local.ts")) {
       const source = readFileSync(new URL(url), "utf8").replace('join(homedir(), ".bops")', `join(${JSON.stringify(scratch)}, ".bops")`).replace("export async function ensureChrome(", "async function unusedChrome(");
       return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source + "\nexport async function ensureChrome() {}") };
@@ -106,7 +142,7 @@ registerHooks({
       return {
         format: "module",
         shortCircuit: true,
-        source: `export const orgo = { bash: async () => ({ exit_code: 0, output: "ok" }) };\nexport class OrgoError extends Error {}\nexport const screenId = () => "";\n`,
+        source: `export const orgo = { screens: async () => [99,100,101,102].map((d) => ({ display: ":" + d })), bash: async (_id, cmd) => { globalThis.__bopsOrgoCommands.push(cmd); return { exit_code: 0, output: "ok" }; } };\nexport class OrgoError extends Error {}\nexport const screenId = () => "";\n`,
       };
     const names = [...readFileSync(new URL(url), "utf8").matchAll(/^export (?:async )?(?:function\*? |const |let |class )([A-Za-z_$][\w$]*)/gm)].map((m) => m[1]);
     const source = names
@@ -197,7 +233,7 @@ while (Date.now() < until && !ofBefore("turn/start").length && store.session(app
 function ofBefore(method) { return calls.filter((c) => c.method === method); }
 const appThread = ofBefore("thread/start").at(-1)?.params;
 if (appThread) {
-  const threadId = store.session(appSession.id).codexThread;
+  const threadId = store.session(appSession.id).taskState?.id ?? store.session(appSession.id).codexThread;
   emit(threadId, "item/completed", { item: { id: "answer", type: "agentMessage", text: "Example Domain" } });
   emit(threadId, "turn/completed", { turn: { id: "turn_1", status: "completed" } });
   for (let i = 0; i < 100 && store.session(appSession.id)?.status !== "done"; i++) await new Promise((r) => setTimeout(r, 10));
@@ -207,7 +243,9 @@ assert.equal(store.session(appSession.id)?.status, "done");
 assert.ok(store.getState().messages.some((m) => m.resultOf === appSession.id && m.text === "Example Domain"), "the task's answer reaches the chat");
 assert.equal(agentBodies.length, 0);
 // Reply after completion exercises persisted ids, not an in-memory adapter handle.
-const savedThread = store.session(appSession.id).codexThread;
+const savedThread = store.session(appSession.id).taskState?.id ?? store.session(appSession.id).codexThread;
+// Force a pre-refactor saved session: the reply must read legacy data and pin its runtime.
+store.patchSession(appSession.id, { taskState: undefined, taskRuntime: undefined, codexThread: savedThread, taskTokens: { input: 0, output: 0 } });
 sessions.replyToSession(appSession.id, "And its first heading?");
 for (let i = 0; i < 100 && ofBefore("turn/start").length < 2; i++) await new Promise((r) => setTimeout(r, 10));
 assert.equal(ofBefore("thread/resume").at(-1)?.params.threadId, savedThread);
@@ -235,8 +273,48 @@ assert.equal(store.getState().bots[0].computerStatus, "none", "no Orgo computer 
 assert.equal(agentBodies.length, 0);
 store.update((s) => { s.host = "mac"; });
 console.log("session lifecycle -> persisted thread resumed, stop saved, Orgo refused before provisioning");
+// The caller must persist and return an arbitrary continuation, including mid-turn updates.
+process.env.BOPS_TASK_RUNTIME = "fixture";
+const extra = sessions.startSession({ botId: "boppy", goal: "An extra runtime task", where: "cloud", fresh: true });
+for (let i = 0; i < 100 && store.session(extra.id)?.status !== "done"; i++) await new Promise((r) => setTimeout(r, 10));
+assert.equal(store.session(extra.id)?.answer, "Fixture revision 1");
+assert.deepEqual(store.session(extra.id)?.taskState, { cursor: { page: "next", revision: 1 } }, "an extra runtime's opaque continuation must persist without caller changes");
+for (let i = 0; i < 100; i++) {
+  const file = join(scratch, ".data/state.json");
+  if (existsSync(file) && JSON.parse(readFileSync(file, "utf8")).sessions.find((s) => s.id === extra.id)?.taskState?.cursor?.revision === 1) break;
+  await new Promise((r) => setTimeout(r, 10));
+}
+assert.deepEqual(JSON.parse(readFileSync(join(scratch, ".data/state.json"), "utf8")).sessions.find((s) => s.id === extra.id).taskState, { cursor: { page: "next", revision: 1 } });
+process.env.BOPS_TASK_RUNTIME = "codex";
+sessions.replyToSession(extra.id, "Continue the saved cursor.");
+for (let i = 0; i < 100 && store.session(extra.id)?.answer !== "Fixture revision 2"; i++) await new Promise((r) => setTimeout(r, 10));
+assert.deepEqual(fixtureOpens.at(-1), { cursor: { page: "next", revision: 1 } }, "a pinned runtime receives its saved continuation after settings change");
+assert.equal(store.session(extra.id)?.answer, "Fixture revision 2");
+// This runtime supports Orgo and releases its claim by contract rather than a known id.
+for (const file of ["vm/bin/bops-screens", "vm/screen_mcp.py"]) {
+  mkdirSync(join(scratch, file, ".."), { recursive: true });
+  writeFileSync(join(scratch, file), readFileSync(join(root, file)));
+}
+store.update((s) => { s.host = "orgo"; s.bots[0].computerId = "comp_fixture"; s.bots[0].computerStatus = "ready"; });
+process.env.BOPS_TASK_RUNTIME = "fixture";
+const extraOrgo = sessions.startSession({ botId: "boppy", goal: "An extra Orgo runtime task", where: "cloud", fresh: true });
+for (let i = 0; i < 100 && !orgoCommands.some((cmd) => cmd === `bops-screens release thread:${extraOrgo.id}`); i++) await new Promise((r) => setTimeout(r, 10));
+assert.equal(store.session(extraOrgo.id)?.answer, "Fixture revision 1", `Orgo fixture error: ${store.session(extraOrgo.id)?.error}; status: ${store.session(extraOrgo.id)?.status}`);
+assert.ok(orgoCommands.some((cmd) => cmd === `bops-screens release thread:${extraOrgo.id}`), "an extra runtime releases Orgo screens through its contract");
+store.update((s) => { s.host = "mac"; });
+delete process.env.BOPS_TASK_RUNTIME;
+// An old Agents continuation without a runtime pin still resumes Agents under a Codex default.
+process.env.OPENAI_API_KEY = "sk-test-not-a-real-key";
+store.patchSession(extra.id, { taskState: undefined, taskRuntime: undefined, agentSessionId: "sess_legacy", env: { id: "env_legacy", remoteUrl: "http://127.0.0.1:9/remote" } });
+sessions.replyToSession(extra.id, "Read the legacy page.");
+for (let i = 0; i < 800 && store.session(extra.id)?.answer !== "OpenAI Example Domain"; i++) await new Promise((r) => setTimeout(r, 10));
+assert.equal(store.session(extra.id)?.answer, "OpenAI Example Domain", "legacy Agents sessions resume under a different configured runtime");
+assert.equal(store.session(extra.id)?.taskRuntime, "openai");
+assert.deepEqual(store.session(extra.id)?.taskState, { id: "sess_legacy", env: { id: "env_legacy", remoteUrl: "http://127.0.0.1:9/remote" } });
+assert.equal(agentBodies.length, 0, "legacy Agents continuation does not create a replacement session");
+console.log("extensible tasks -> opaque persisted continuation, pinned reply and Orgo release");
 calls.length = 0;
-store.update((s) => { s.sessions = []; s.messages = []; });
+store.update((s) => { s.sessions = []; s.messages = []; s.usage = []; });
 process.env.OPENAI_API_KEY = "sk-test-not-a-real-key";
 console.log("session runner -> Mac task answered and saved in chat without an OpenAI key");
 if (process.argv.includes("red")) { fake.close(); rmSync(scratch, { recursive: true, force: true }); process.exit(0); }
@@ -687,8 +765,18 @@ if (reviewRegressions[process.argv[2]]) {
   assert.equal(params.sandbox, "read-only");
   assert.equal(params.config.mcp_servers, undefined, "no bot browser on Your Mac");
   const targets = [];
-  const pending = rt.turn({ thread, input: "Use Calculator", effort: "medium", botId: "boppy", epoch: store.stateEpoch(), hooks: { step() {}, caption() {}, isStopped: () => false, bindStop() {}, computer: (apps, target) => targets.push({ apps, target }) } });
+  const nativeSessionId = "ses_native_approval_contract";
+  store.update((s) => { s.sessions.push({ id: nativeSessionId, botId: "boppy", chatId: "bot:boppy", title: "Native approval contract", goal: "Use Calculator", host: "mac", runsOn: "mac", status: "running", steps: [], replies: [], taskState: rt.snapshot(thread) }); });
+  const pending = rt.turn({ thread, sessionId: nativeSessionId, input: "Use Calculator", effort: "medium", botId: "boppy", epoch: store.stateEpoch(), hooks: { step() {}, caption() {}, isStopped: () => false, bindStop() {}, computer: (apps, target) => targets.push({ apps, target }) } });
   await tick();
+  const approvalRouter = (await import(`${root}/lib/server/codex.ts?approval-contract`)).codex;
+  await approvalRouter.ask({ id: "native-command", method: "item/commandExecution/requestApproval", params: { threadId: thread.id, command: "calculator-check" } });
+  await approvalRouter.ask({ id: "native-app", method: "mcpServer/elicitation/request", params: { threadId: thread.id, serverName: "computer_use", message: 'Allow use "Messages"' } });
+  for (const approval of store.getState().mac.approvals) {
+    assert.equal(approval.sessionId, nativeSessionId, "native app approvals retain their session association after opaque persistence");
+    assert.equal(approval.botId, "boppy");
+  }
+  assert.equal(store.getState().mac.approvals.length, 2);
   emit(thread.id, "item/started", { item: { id: "native", type: "mcpToolCall", server: "cua_repl", tool: "js", arguments: { code: 'await cua.getApp("Calculator")', title: "Open Calculator" } } });
   emit(thread.id, "item/completed", { item: { id: "native_answer", type: "agentMessage", text: "4" } });
   emit(thread.id, "turn/completed", { turn: { status: "completed" } });

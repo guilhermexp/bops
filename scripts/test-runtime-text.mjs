@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { registerHooks } from "node:module";
+import { registerHooks, stripTypeScriptTypes } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -36,6 +36,11 @@ Object.assign(process.env, {
 });
 const only = process.argv[2];
 const root = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
+const fixtureReply = () => ({ text: "Fixture text response.", calls: [], next: async () => fixtureReply() });
+globalThis.__bopsFixtureText = {
+  respond: async () => fixtureReply(),
+  outOfCredit: async () => false,
+};
 // Modules that would start processes when loaded (the relay's agent) or that Node can't load (the
 // desktop look draws the mascot's JSX, mirror.ts has parameter properties) are stand-ins: each of their
 // exports does nothing (as scripts/test-plan.mjs). Codex's is real where its CLI is installed (Codex
@@ -56,6 +61,28 @@ registerHooks({
     }
   },
   load(url, context, next) {
+    if (url.endsWith("/runtime/config.ts")) {
+      const source = readFileSync(new URL(url), "utf8").replace('["openai", "codex"] as const', '["openai", "codex", "fixture"] as const');
+      return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source) };
+    }
+    if (url.endsWith("/runtime/text/index.ts")) {
+      const original = readFileSync(new URL(url), "utf8");
+      const source = original.replace(/(codex:\s*codexText)(\s*};)/, "$1, fixture: globalThis.__bopsFixtureText$2");
+      if (source === original) throw new Error("The test could not register its fixture text runtime.");
+      return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source) };
+    }
+    if (url.endsWith("/runtime/tasks/index.ts")) {
+      const original = readFileSync(new URL(url), "utf8");
+      const source = original.replace(/(const TASKS\s*:[^=]+=\s*\{[\s\S]*?\};)/, "$1\nexport const __testTaskRuntimeIds = Object.keys(TASKS);");
+      if (source === original) throw new Error("The test could not inspect its task runtime registry.");
+      return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source) };
+    }
+    if (url.endsWith("/runtime/voice/index.ts")) {
+      const original = readFileSync(new URL(url), "utf8");
+      const source = original.replace(/(const runtimes\s*:[^=]+=\s*\{[\s\S]*?\};)/, "$1\nexport const __testVoiceRuntimeIds = Object.keys(runtimes);");
+      if (source === original) throw new Error("The test could not inspect its voice runtime registry.");
+      return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source) };
+    }
     const name = url.match(/\/lib\/server\/([a-z-]+)\.ts$/)?.[1];
     if (!name || !STAND_INS.has(name)) return next(url, context);
     const names = [...readFileSync(new URL(url), "utf8").matchAll(/^export (?:async )?(?:function\*? |const |let |class )([A-Za-z_$][\w$]*)/gm)].map((m) => m[1]);
@@ -233,6 +260,8 @@ const send = async (words) => {
   return lastBot();
 };
 const tokensOf = (source) => (S.getState().usage ?? []).filter((u) => u.kind === "model.tokens" && u.source === source);
+let unknownRuntimeId = "__unknown_runtime__";
+while (config.RUNTIMES.includes(unknownRuntimeId)) unknownRuntimeId += "_";
 
 /* ---------------- Which runtime runs text ---------------- */
 
@@ -244,15 +273,46 @@ const tokensOf = (source) => (S.getState().usage ?? []).filter((u) => u.kind ===
   process.env.BOPS_TEXT_RUNTIME = "openai";
   assert.equal(config.runtimeFor("text"), "openai", "BOPS_TEXT_RUNTIME wins for text");
   assert.equal(config.runtimeFor("tasks"), "codex", "and only for text");
-  process.env.BOPS_TEXT_RUNTIME = "anthropic";
-  assert.throws(() => config.runtimeFor("text"), { message: 'Unknown runtime "anthropic" in BOPS_TEXT_RUNTIME. Use openai or codex.' });
+  process.env.BOPS_TEXT_RUNTIME = unknownRuntimeId;
+  assert.throws(() => config.runtimeFor("text"), { message: `Unknown runtime "${unknownRuntimeId}" in BOPS_TEXT_RUNTIME. Use ${config.RUNTIMES.join(" or ")}.` });
   delete process.env.BOPS_TEXT_RUNTIME;
-  process.env.BOPS_RUNTIME = "gemini";
+  process.env.BOPS_RUNTIME = unknownRuntimeId;
   const before = codexAsked.length + openaiAsked.length;
-  await assert.rejects(text.generateText({ role: "chat", effort: "low", instructions: "x", input: "x", usage: { source: "chat" } }), { message: 'Unknown runtime "gemini" in BOPS_RUNTIME. Use openai or codex.' });
+  await assert.rejects(text.generateText({ role: "chat", effort: "low", instructions: "x", input: "x", usage: { source: "chat" } }), { message: `Unknown runtime "${unknownRuntimeId}" in BOPS_RUNTIME. Use ${config.RUNTIMES.join(" or ")}.` });
   assert.equal(codexAsked.length + openaiAsked.length, before, "an unknown runtime asks no one");
   process.env.BOPS_RUNTIME = "codex";
   console.log("selection -> openai by default, per capability over BOPS_RUNTIME, unknown ids refused");
+}
+
+/* ---------------- A text-only fixture runtime responds and names the capabilities it lacks ---------------- */
+
+{
+  process.env.BOPS_TEXT_RUNTIME = "fixture";
+  const reply = await text.generateText({ role: "chat", effort: "low", instructions: "x", input: "x", usage: { source: "chat" } });
+  assert.equal(reply.text, "Fixture text response.");
+  assert.equal(await text.textOutOfCredit(), false);
+  delete process.env.BOPS_TEXT_RUNTIME;
+
+  const tasks = await import(`${root}/lib/server/runtime/tasks/index.ts`);
+  const voice = await import(`${root}/lib/server/runtime/voice/index.ts`);
+  const assertMissingCapability = (error, capability, supported) => {
+    assert.ok(error.message.includes('"fixture"'), error.message);
+    assert.ok(error.message.includes(`BOPS_${capability.toUpperCase()}_RUNTIME`), error.message);
+    assert.ok(!supported.includes("fixture"), "the fixture is absent from this capability registry");
+    for (const id of supported) assert.ok(error.message.includes(id), `${error.message} (missing supported runtime ${id})`);
+    return true;
+  };
+  assert.throws(
+    () => tasks.tasksRuntime("fixture"),
+    (error) => assertMissingCapability(error, "task", tasks.__testTaskRuntimeIds),
+  );
+  process.env.BOPS_VOICE_RUNTIME = "fixture";
+  await assert.rejects(
+    voice.answerVoice(main, "offer", "test"),
+    (error) => assertMissingCapability(error, "voice", voice.__testVoiceRuntimeIds),
+  );
+  delete process.env.BOPS_VOICE_RUNTIME;
+  console.log("fixture -> text responds; unsupported task and voice name their runtime choices");
 }
 
 /* ---------------- Text on the ChatGPT plan: what the Codex backend gets ---------------- */

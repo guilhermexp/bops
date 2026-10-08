@@ -3,17 +3,22 @@ import type { Bot } from "@/lib/types";
 import { runtimeFor, type RuntimeId } from "../config";
 import { codexVoiceRuntime } from "./codex";
 import { openaiVoice } from "./openai";
-import { voiceFor, voiceOnPlan } from "./voices";
 import type { VoiceRuntime } from "./types";
 
 export { voiceFor, rememberVoices } from "./voices";
 
-const runtimes: Record<RuntimeId, VoiceRuntime> = { openai: openaiVoice, codex: codexVoiceRuntime };
+const runtimes: Partial<Record<RuntimeId, VoiceRuntime>> = { openai: openaiVoice, codex: codexVoiceRuntime };
+
+function voiceRuntime(id: RuntimeId): VoiceRuntime {
+  const runtime = runtimes[id];
+  if (!runtime) throw new Error(`Runtime "${id}" doesn't support voice. Use ${Object.keys(runtimes).map((id) => `BOPS_VOICE_RUNTIME=${id}`).join(" or ")}.`);
+  return runtime;
+}
 
 export async function answerVoice(bot: Bot, sdp: string, instructions: string) {
-  const id = runtimeFor("voice");
-  const voice = await (id === "codex" ? voiceOnPlan(bot) : voiceFor(bot));
-  return runtimes[id].answer({ sdp, instructions, voice });
+  const runtime = voiceRuntime(runtimeFor("voice"));
+  const voice = await runtime.chooseVoice(bot);
+  return runtime.answer({ sdp, instructions, voice });
 }
 
 // Calls retain their runtime when settings change during a conversation.

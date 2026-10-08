@@ -1,6 +1,8 @@
 import "server-only";
 import { noteOutOfCredit, OUT_OF_CREDIT } from "../../cloud";
 import { openaiClient } from "../../openai-client";
+import type { Bot } from "@/lib/types";
+import { voiceFor } from "./voices";
 import type { VoiceClient, VoiceRuntime } from "./types";
 
 /**
@@ -24,6 +26,9 @@ const PAGE: VoiceClient = {
 };
 
 export const openaiVoice: VoiceRuntime = {
+  chooseVoice(bot: Bot) {
+    return voiceFor(bot);
+  },
   async answer({ sdp, instructions, voice }) {
     try {
       const result = await client.live.create({

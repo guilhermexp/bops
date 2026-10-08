@@ -1,5 +1,7 @@
 /** Shared shapes for the Bops app state, used by both the server and the UI. */
 
+import type { RuntimeId } from "./server/runtime/config";
+
 export type BotId = string;
 
 export type Bot = {
@@ -257,8 +259,10 @@ export type Session = {
   /** The screen it last held, so a finished session can still show where it left off. */
   lastDisplay?: number;
   /** The runtime that created this task, kept across replies and server restarts. */
-  taskRuntime?: "openai" | "codex";
-  /** Counted Codex thread usage, so replies and restarts count only new requests. */
+  taskRuntime?: RuntimeId;
+  /** Serializable continuation owned and interpreted only by the selected runtime. */
+  taskState?: unknown;
+  /** Legacy continuation fields, read by their runtimes for pre-refactor sessions. */
   taskTokens?: { input: number; output: number };
   agentSessionId?: string;
   /** The Agents API environment its executor connects to, kept so a finished thread can pick up again. */
@@ -290,8 +294,9 @@ export type Session = {
   thenOnMac?: string;
   /** On the Mac: the apps it has used, most recent last (for the live window previews). */
   macApps?: string[];
-  /** On the Mac: the Codex thread it runs in, and its current turn (to stop it). */
+  /** Legacy thread id; the native runtime also keeps it as the Mac approval router's alias. */
   codexThread?: string;
+  /** The current native/browser turn, for the live Stop control. */
   codexTurn?: string;
   /** What the bot is doing right now, in a word or two ("searching", "filling a form"), for its cursor caption. */
   activity?: string;

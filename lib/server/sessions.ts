@@ -262,7 +262,7 @@ async function pump() {
         continue;
       }
       try {
-        tasksRuntime(s.taskRuntime ?? (s.agentSessionId ? "openai" : taskRuntimeId())).assertHost(s.host);
+        tasksRuntime(taskRuntimeId(s)).assertHost(s.host);
       } catch (e) {
         const error = (e as Error).message;
         patchSession(s.id, { status: "failed", error, endedAt: Date.now() });
@@ -795,7 +795,7 @@ async function run(sessionId: string) {
   const port = cdpPort(getState().bots.indexOf(b), display);
   const workspace = mac ? WORKSPACE : "/workspace";
   let thread: TaskThread | undefined;
-  const runtimeId = s.taskRuntime ?? (s.agentSessionId ? "openai" : taskRuntimeId());
+  const runtimeId = taskRuntimeId(s);
   const runtime = tasksRuntime(runtimeId);
   let unwatch: (() => void) | undefined;
   try {
@@ -828,21 +828,21 @@ async function run(sessionId: string) {
     const endpoint = screenEndpoint(b, display);
     if (endpoint) unwatch = watchScreen(b.id, display, endpoint, sessionId);
 
-    const resume = runtimeId === "codex" ? s.codexThread ? { id: s.codexThread, tokens: s.taskTokens } : undefined : s.agentSessionId && s.env ? { id: s.agentSessionId, env: s.env } : undefined;
-    const resuming = !!resume;
+    const resume = runtime.resume(s);
+    const resuming = resume !== undefined;
     const effort = s.effort ?? await threadEffort(b.effort, s.goal);
     patchSession(sessionId, { effort });
     const memory = await memoryBlock(wsOf(s.botId), s.goal, 3000);
     thread = await runtime.open({
       effort, botId: b.id, resume,
-      opened: (opened) => patchSession(sessionId, runtimeId === "codex" ? { codexThread: opened.id } : { agentSessionId: opened.id, env: opened.env }),
+      opened: (opened) => patchSession(sessionId, { taskState: runtime.snapshot(opened) }),
       place: mac ? { host: "mac", cdpPort: port, workspace } : { host: "orgo", computerId, display, sessionId, botId: b.id, workspace },
       instructions: [
         instructions(b.name, b.role, mac, display, c.id !== b.id ? c.name : undefined, !mac && !!appsReach.get(computerId) && accountsOf(b).length > 0),
         appsNote(b, "task", { tools: !mac && !!appsReach.get(computerId) }), placesNote(b, "task"), memory,
       ].filter(Boolean).join("\n\n"),
     });
-    patchSession(sessionId, runtimeId === "codex" ? { codexThread: thread.id } : { agentSessionId: thread.id, env: thread.env });
+    patchSession(sessionId, { taskState: runtime.snapshot(thread) });
     step(sessionId, "setup", "At the computer");
     // The cursor says something from the first moment; Jev's read of the steps takes over from here.
     patchSession(sessionId, { status: "running", activity: "getting started" });
@@ -902,7 +902,7 @@ async function run(sessionId: string) {
     interrupts.delete(sessionId);
     patchSession(sessionId, { helperScreens: undefined, helperTasks: undefined, helperOrder: undefined });
     if (thread) await runtime.close(thread);
-    if (!mac && runtimeId === "openai") {
+    if (!mac && runtime.releaseScreens) {
       await orgo
         .bash(
           computerId,
@@ -990,16 +990,18 @@ async function runMac(sessionId: string) {
     const memory = await memoryBlock(wsOf(s.botId), s.goal, 3000);
     const effort = s.effort ?? await threadEffort(b.effort, s.goal);
     patchSession(sessionId, { effort });
+    const resume = runtime.resume(s);
     thread = await runtime.open({
       botId: b.id, effort, native: true, apps, place: { host: "mac", cdpPort: 0, workspace: WORKSPACE },
-      resume: s.codexThread ? { id: s.codexThread, tokens: s.taskTokens } : undefined,
+      resume,
+      opened: (opened) => patchSession(sessionId, { taskState: runtime.snapshot(opened) }),
       instructions: [macInstructions(b.name, b.isMain ? "chief of staff" : b.role), appsNote(b, "task", { tools: !!apps }), placesNote(b, "task"), memory].filter(Boolean).join("\n\n"),
     });
-    patchSession(sessionId, { codexThread: thread.id });
+    patchSession(sessionId, { taskState: runtime.snapshot(thread) });
     step(sessionId, "setup", "On your Mac");
     patchSession(sessionId, { status: "running", activity: "getting started" });
 
-    let input: string | undefined = s.codexThread && s.answer ? takeReplies(sessionId) : s.goal;
+    let input: string | undefined = resume !== undefined && s.answer ? takeReplies(sessionId) : s.goal;
     while (input) {
       if (stopped.has(sessionId)) throw new Error("Stopped by you");
       patchSession(sessionId, { blocker: undefined });
@@ -1053,7 +1055,7 @@ function taskHooks(sessionId: string): TaskHooks {
     caption: (activity) => patchSession(sessionId, { activity }),
     isStopped: () => stopped.has(sessionId),
     bindStop: (stop) => interrupts.set(sessionId, stop),
-    tokens: (taskTokens) => patchSession(sessionId, { taskTokens }),
+    saveState: (taskState) => patchSession(sessionId, { taskState }),
     turnId: (codexTurn) => patchSession(sessionId, { codexTurn }),
     computer: (apps, target) => {
       if (apps.length) patchSession(sessionId, (x) => void (x.macApps = [...(x.macApps ?? []).filter((a) => !apps.includes(a)), ...apps].slice(-4)));

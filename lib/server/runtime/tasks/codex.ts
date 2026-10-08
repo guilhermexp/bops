@@ -2,13 +2,15 @@ import "server-only";
 import { mkdirSync } from "node:fs";
 import { codex } from "../../codex";
 import { browserServer } from "../../local";
+import { patchSession } from "../../store";
 import { recordTokens } from "../../usage";
 import { codexAuth, CodexSignInError, type CodexAuth } from "../codex/auth";
 import { CodexLimitError } from "../codex/client";
-import { taskModel, type TaskOpen, type TaskThread, type TaskTurn, type TasksRuntime } from "./types";
+import { taskModel, type TaskOpen, type TaskTurn, type TasksRuntime } from "./types";
 
 const TURN_TIMEOUT_MS = 10 * 60_000;
-type CodexThread = TaskThread & { auth: CodexAuth; native?: boolean };
+type CodexState = { id: string; tokens?: { input: number; output: number } };
+type CodexThread = CodexState & { auth: CodexAuth; native?: boolean };
 type Problem = { message?: string; code?: string | number; codexErrorInfo?: string | Record<string, unknown>; resets_at?: number; resets_in_seconds?: number };
 
 function failure(error: Problem, auth: CodexAuth): Error {
@@ -51,20 +53,24 @@ async function settings(req: TaskOpen) {
 }
 
 export const codexTasks: TasksRuntime = {
+  releaseScreens: false,
+  resume(session) { return session.taskState !== undefined ? session.taskState : (session.codexThread ? { id: session.codexThread, tokens: session.taskTokens } : undefined); },
+  snapshot(thread) { const { id, tokens } = thread as CodexThread; return { id, tokens }; },
   assertHost(host) {
     if (host === "orgo") throw new Error("Codex tasks work on this Mac only. Use BOPS_TASK_RUNTIME=openai for an Orgo computer.");
   },
   async outOfCredit() { return false; },
   async open(req) {
     this.assertHost(req.place.host);
+    const resume = req.resume as CodexState | undefined;
     const auth = await codexAuth();
     mkdirSync(req.place.workspace, { recursive: true });
     await codex.ready();
     try {
-      const result = req.resume
-        ? await codex.request<{ thread: { id: string } }>("thread/resume", { threadId: req.resume.id, ...await settings(req) })
+      const result = resume
+        ? await codex.request<{ thread: { id: string } }>("thread/resume", { threadId: resume.id, ...await settings(req) })
         : await codex.request<{ thread: { id: string } }>("thread/start", { ...await settings(req), serviceName: "Bops" });
-      const thread: CodexThread = { id: result.thread.id, auth, native: req.native, tokens: req.resume ? req.resume.tokens : { input: 0, output: 0 } };
+      const thread: CodexThread = { id: result.thread.id, auth, native: req.native, tokens: resume ? resume.tokens : { input: 0, output: 0 } };
       req.opened?.(thread);
       return thread;
     } catch (e) {
@@ -79,8 +85,11 @@ export const codexTasks: TasksRuntime = {
   },
 };
 
-function turn({ thread, input, effort, botId, epoch, hooks }: TaskTurn): Promise<string> {
-  const { auth, native } = thread as CodexThread;
+function turn({ thread, input, effort, botId, epoch, sessionId, hooks }: TaskTurn): Promise<string> {
+  const saved = thread as CodexThread;
+  const { auth, native } = saved;
+  // The Mac approval router still associates questions through this thread alias.
+  if (native && sessionId) patchSession(sessionId, { codexThread: thread.id });
   return new Promise((resolve, reject) => {
     let last = "";
     let turnId: string | undefined;
@@ -131,13 +140,13 @@ function turn({ thread, input, effort, botId, epoch, hooks }: TaskTurn): Promise
         if (total) {
           // Total spans all model requests, including tool loops. A resumed old thread without a
           // saved baseline starts at the last request; new threads start at zero.
-          const before = thread.tokens ?? { input: total.inputTokens - (usage?.inputTokens ?? 0), output: total.outputTokens - (usage?.outputTokens ?? 0) };
+          const before = saved.tokens ?? { input: total.inputTokens - (usage?.inputTokens ?? 0), output: total.outputTokens - (usage?.outputTokens ?? 0) };
           const input = Math.max(0, total.inputTokens - before.input);
           const output = Math.max(0, total.outputTokens - before.output);
           if (input || output) recordTokens("session", model, { input_tokens: input, output_tokens: output }, botId, epoch);
           countedTotal = true;
-          thread.tokens = { input: total.inputTokens, output: total.outputTokens };
-          hooks.tokens?.(thread.tokens);
+          saved.tokens = { input: total.inputTokens, output: total.outputTokens };
+          hooks.saveState?.(codexTasks.snapshot(saved));
         }
       }
       else if (m.method === "item/reasoning/summaryTextDelta") {

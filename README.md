@@ -130,6 +130,8 @@ The Codex voice endpoint is not a public API and identifies as Codex Desktop, as
 
 Legacy OpenAI SIP calls require `BOPS_VOICE_RUNTIME=openai`. AgentPhone uses the text runtime and continues to work with `codex`. `BOPS_CODEX_CLIENT_VERSION` overrides the voice client version (default 0.161.0). `BOPS_VOICE_SIDEBAND_BASE` overrides the sideband URL for local fake servers; normally leave it unset. Signaling uses the existing `BOPS_CODEX_BASE_URL` override.
 
+To add another runtime, add its id in `runtime/config.ts`, a file for each supported capability and an entry in that capability's registry. Unsupported capabilities refuse with the runtime setting to use. Callers and shared session types stay unchanged; task continuation and voice choice belong to the provider. See the exact [Adding a runtime checklist](lib/server/runtime/AGENTS.md#adding-a-runtime). Existing saved task threads remain resumable through their legacy continuation fields.
+
 ### Texts and calls (optional)
 
 1. Deploy `edge/` (see `edge/fly.toml`): it needs a Tailscale login and `BOPS_UPSTREAM` (your Mac's tailnet address, port 3210).

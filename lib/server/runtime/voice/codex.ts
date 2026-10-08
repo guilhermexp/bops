@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
 import { codexAuth, CodexSignInError, type CodexAuth } from "../codex/auth";
 import { codexBaseUrl, CodexLimitError } from "../codex/client";
+import type { Bot } from "@/lib/types";
+import { voiceOnPlan } from "./voices";
 import type { VoiceEvent, VoiceRuntime, VoiceStart } from "./types";
 
 type Call = { socket: WebSocket; events: VoiceEvent[]; base: number; input: string; output: string; closed: boolean; lastRole?: "input" | "output"; inputFinal: boolean; outputFinal: boolean; inputTurn: number; outputTurn: number; expiry?: ReturnType<typeof setTimeout> };
@@ -151,6 +153,9 @@ function chunks(text: string) {
 }
 
 export const codexVoiceRuntime: VoiceRuntime = {
+  chooseVoice(bot: Bot) {
+    return voiceOnPlan(bot);
+  },
   async answer(input) {
     const { sdp, callId, auth, session, realtime } = await signal(input);
     await open(callId, auth, session, realtime);

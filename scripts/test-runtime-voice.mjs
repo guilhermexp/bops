@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { registerHooks } from "node:module";
+import { registerHooks, stripTypeScriptTypes } from "node:module";
 import { tmpdir } from "node:os";
 import { mock } from "node:test";
 import { join } from "node:path";
@@ -21,6 +21,17 @@ const codexHome = join(scratch, "codex-home");
 mkdirSync(codexHome, { recursive: true });
 const root = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const STAND_INS = new Set(["codex", "relay", "desktop", "mirror"]);
+let fixtureVoiceInput;
+globalThis.__bopsFixtureVoice = {
+  chooseVoice: async () => "fixture-voice",
+  answer: async (input) => {
+    fixtureVoiceInput = input;
+    return { sdp: "fixture-answer", sessionId: "fixture-session", client: { transport: "server", callId: "fixture-call" } };
+  },
+  say: async () => {},
+  close: async () => {},
+  events: () => null,
+};
 registerHooks({
   resolve(specifier, context, next) {
     if (specifier.startsWith("@/")) specifier = pathToFileURL(`${root}/${specifier.slice(2)}`).href;
@@ -36,6 +47,16 @@ registerHooks({
     }
   },
   load(url, context, next) {
+    if (url.endsWith("/runtime/config.ts")) {
+      const source = readFileSync(new URL(url), "utf8").replace('["openai", "codex"] as const', '["openai", "codex", "fixture"] as const');
+      return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source) };
+    }
+    if (url.endsWith("/runtime/voice/index.ts")) {
+      const original = readFileSync(new URL(url), "utf8");
+      const source = original.replace("codex: codexVoiceRuntime };", "codex: codexVoiceRuntime, fixture: globalThis.__bopsFixtureVoice };");
+      if (source === original) throw new Error("The test could not register its fixture voice runtime.");
+      return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source) };
+    }
     const name = url.match(/\/lib\/server\/([a-z-]+)\.ts$/)?.[1];
     if (!name || !STAND_INS.has(name)) return next(url, context);
     const names = [...readFileSync(new URL(url), "utf8").matchAll(/^export (?:async )?(?:function\*? |const |let |class )([A-Za-z_$][\w$]*)/gm)].map((m) => m[1]);
@@ -166,6 +187,15 @@ S.update((s) => {
 const boppy = S.getState().bots.find((b) => b.isMain);
 assert.equal(boppy.name, "Boppy");
 const token = signIn();
+
+{
+  process.env.BOPS_VOICE_RUNTIME = "fixture";
+  const voice = await import(`${root}/lib/server/runtime/voice/index.ts`);
+  await voice.answerVoice(boppy, OFFER, "fixture test");
+  assert.equal(fixtureVoiceInput.voice, "fixture-voice", "the selected runtime chooses the voice it sends to its provider");
+  delete process.env.BOPS_VOICE_RUNTIME;
+  console.log("fixture voice -> answer uses the runtime's own voice choice");
+}
 
 const post = (body) => callRoute.POST(new Request("http://127.0.0.1/api/call", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }));
 const eventsOf = async (callId, after) => {

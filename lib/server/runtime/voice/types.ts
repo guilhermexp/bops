@@ -1,3 +1,5 @@
+import type { Bot } from "@/lib/types";
+
 /**
  * The voice capability: one live call with a bot, started from the browser's WebRTC offer. The page
  * plays the audio. It learns captions and delegations from `client`, which is everything it needs
@@ -39,6 +41,7 @@ export type VoiceAnswer = { sdp: string; sessionId: string; client: VoiceClient 
 export type VoiceStart = { sdp: string; instructions: string; voice: string };
 
 export type VoiceRuntime = {
+  chooseVoice(bot: Bot): Promise<string>;
   answer(input: VoiceStart): Promise<VoiceAnswer>;
   /** Text the model should take in: a greeting, progress, or a result. `delegationId` ties it to one the model opened. */
   say(callId: string, text: string, delegationId: string | null, complete?: boolean): Promise<void>;
