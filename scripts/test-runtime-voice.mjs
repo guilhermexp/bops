@@ -455,7 +455,8 @@ if (focusedLifecycle) {
   const json = await res.json();
   assert.equal(res.status, 502);
   assert.match(json.error, /I've hit the usage limit on your ChatGPT Pro plan/);
-  assert.match(json.error, /It's back at /);
+  // "It's back at 9:41 PM." the same day; "It's back Thursday, Oct 8 at 12:00 AM." once the reset is past midnight.
+  assert.match(json.error, /It's back (\w+day, \w+ \d+ )?at /);
   const from = signaling.length;
   const again = await post({ action: "start", botId: boppy.id, sdp: OFFER });
   const againJson = await again.json();
