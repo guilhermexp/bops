@@ -86,7 +86,7 @@ Everything runs on your Mac except the bots' computers and the providers. `edge/
 ## Requirements
 
 - macOS on Apple Silicon, Node 22 or newer.
-- **Required:** an OpenAI API key and an Orgo account. Text (chat, phone turns) and Mac browser tasks can run on your ChatGPT plan instead: see [Model runtimes](#model-runtimes).
+- **Required:** an OpenAI API key and an Orgo account. Text (chat, phone turns), Mac browser tasks and calls in the app can run on your ChatGPT plan instead: see [Model runtimes](#model-runtimes).
 - **Recommended:** Typesafe (small judgment calls), Honcho (memory), Composio (apps), AgentMail (email), Tailscale (direct live view of the bots' screens).
 - **Optional:** AgentPhone plus a public URL for texts and calls (see `edge/`).
 - **For "Your Mac":** the Codex CLI signed in with ChatGPT (with computer use), and `cua-driver` (default `~/.local/bin/cua-driver`). macOS asks for Screen Recording and Accessibility.
@@ -119,10 +119,16 @@ Bops reaches its models through a runtime (`lib/server/runtime/`). `openai` (the
 BOPS_RUNTIME=codex          # every capability
 BOPS_TEXT_RUNTIME=codex     # or one at a time: text (chat, memory, watches, suggested replies, phone turns),
 BOPS_TASK_RUNTIME=codex     # tasks in the bots' Mac browsers (openai for Orgo),
-BOPS_VOICE_RUNTIME=openai   # voice (calls in the app)
+BOPS_VOICE_RUNTIME=codex    # voice (calls in the app)
 ```
 
-Today `codex` covers text and tasks in bot browsers on host `mac`, without an OpenAI key. Select the Mac browser host for those tasks; Orgo is refused before any computer is created, with a message to use `BOPS_TASK_RUNTIME=openai`. OpenAI tasks retain the Agents API/executor path on Mac and Orgo. Native **Your Mac** tasks use Codex in both runtimes, with the existing app approval cards. Voice still runs on OpenAI. On `codex`, text and tasks count against your plan's 5-hour and weekly limits, and when a limit is reached the bot says so and when it's back. The backend it uses (`chatgpt.com/backend-api/codex`) isn't a public API: it can change, and it's for your own use on your own Mac only. `BOPS_CHAT_MODEL` and `BOPS_PHONE_MODEL` pick text models in both runtimes. Tasks use `BOPS_SESSION_MODEL` (default `gpt-6.1-sol`), or `BOPS_HARD_MODEL` (default `gpt-6-astra`) for high effort. Replies keep the same task thread after completion or a server restart; Stop interrupts the current turn. Task browser tools and coding instructions are isolated from your personal Codex tools/skills. Browser tasks expose an explicit allowlist of browser interactions, excluding host-code execution and file uploads; workspace commands cannot inherit extra writable roots, network access or writable tmp directories from your Codex config. For a separate test instance, `BOPS_CDP_BASE_PORT` changes its bot browser port range (default 9300).
+Today `codex` covers text, tasks in bot browsers on host `mac` and calls in the app, without an OpenAI key. Select the Mac browser host for those tasks; Orgo is refused before any computer is created, with a message to use `BOPS_TASK_RUNTIME=openai`. OpenAI tasks retain the Agents API/executor path on Mac and Orgo. Native **Your Mac** tasks use Codex in both runtimes, with the existing app approval cards. On `codex`, text, tasks and calls count against your plan's 5-hour and weekly limits, and when a limit is reached the bot says so and when it's back. The backend it uses (`chatgpt.com/backend-api/codex`) isn't a public API: it can change, and it's for your own use on your own Mac only. `BOPS_CHAT_MODEL` and `BOPS_PHONE_MODEL` pick text models in both runtimes. Tasks use `BOPS_SESSION_MODEL` (default `gpt-6.1-sol`), or `BOPS_HARD_MODEL` (default `gpt-6-astra`) for high effort. Replies keep the same task thread after completion or a server restart; Stop interrupts the current turn. Task browser tools and coding instructions are isolated from your personal Codex tools/skills. Browser tasks expose an explicit allowlist of browser interactions, excluding host-code execution and file uploads; workspace commands cannot inherit extra writable roots, network access or writable tmp directories from your Codex config. For a separate test instance, `BOPS_CDP_BASE_PORT` changes its bot browser port range (default 9300).
+
+Live calls in the app support both voice runtimes. `openai` keeps gpt-live-1, the API/cloud client and its browser data channel. `codex` uses your Codex ChatGPT sign-in for gpt-live-1-codex: your browser handles the microphone and WebRTC audio, while Bops authenticates signaling and the live sideband on the server. No OpenAI API key is needed. Captions, work delegated to the bot's chat, hang-up, call minutes and a readable chat transcript are preserved.
+
+The Codex voice endpoint is not a public API and identifies as Codex Desktop, as explicitly selected for this local fork. This path worked without an attestation header in the local proof, but backend behavior may change. Boppy/Sam use Cove; other bots have stable voices selected from local voice pools. Those pools are presentation choices, not official gender metadata.
+
+Legacy OpenAI SIP calls require `BOPS_VOICE_RUNTIME=openai`. AgentPhone uses the text runtime and continues to work with `codex`. `BOPS_CODEX_CLIENT_VERSION` overrides the voice client version (default 0.161.0). `BOPS_VOICE_SIDEBAND_BASE` overrides the sideband URL for local fake servers; normally leave it unset. Signaling uses the existing `BOPS_CODEX_BASE_URL` override.
 
 ### Texts and calls (optional)
 

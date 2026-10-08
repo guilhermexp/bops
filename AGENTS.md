@@ -49,7 +49,7 @@ Clone de `github.com/nickvasilescu/bops` mantido localmente pelo dono para self-
 
 ## Verification
 
-Gates estáticos (os mesmos do CI em `.github/workflows/ci.yml`):
+Gates estáticos e testes (CI em `.github/workflows/ci.yml` roda typegen, tsc e lint):
 
 ```bash
 npx next typegen
@@ -58,6 +58,7 @@ npm run lint            # 0 errors; warnings preexistentes em site/
 node --conditions=react-server scripts/test-phone-voice.mjs
 node --conditions=react-server scripts/test-runtime-text.mjs
 node --conditions=react-server scripts/test-runtime-tasks.mjs
+node --conditions=react-server scripts/test-runtime-voice.mjs
 ```
 
 Test Coverage Matrix:
@@ -67,6 +68,7 @@ Test Coverage Matrix:
 | `lib/server/phone-voice.ts`, `app/api/phone/agentphone` | integração com OpenAI/backend Codex/AgentPhone falsos (runtimes openai e codex) | `node --conditions=react-server scripts/test-phone-voice.mjs` |
 | `lib/server/runtime/text/**`, `lib/server/runtime/codex/**`, chamadores de texto (`chat.ts`, `memory.ts`, `watches.ts`, `sessions.ts` `suggestReplies`), `lib/server/codex.ts` (app-server sobe na config do usuário) | integração com backend Codex/OpenAI falsos, `CODEX_HOME` temporário; Codex CLI real sem rede | `node --conditions=react-server scripts/test-runtime-text.mjs` |
 | `lib/server/runtime/tasks/**`, `sessions.ts` (tarefas) | integração com singleton app-server e Agents API falsos, workspace/estado temporários; inclui ciclo da sessão/chat e regressões de allowlist MCP, sandbox herdado, limite estruturado e narração nativa | `node --conditions=react-server scripts/test-runtime-tasks.mjs` |
+| `lib/server/runtime/voice/**`, `lib/server/call.ts`, `/api/call`, CallBar, guarda SIP | integração com sinalização/sideband/texto falsos em localhost; chamada real isolada com WAV | `node --conditions=react-server scripts/test-runtime-voice.mjs` · roteiro de verificação real |
 | `lib/server/**` demais | typecheck + lint | `npx tsc --noEmit -p .` · `npm run lint` |
 | fluxo do app | e2e real | roteiro abaixo |
 
@@ -105,4 +107,4 @@ Criar AGENTS.md filho quando a pasta vira boundary durável com regra própria. 
 
 ## Child DOX Index
 
-- [lib/server/runtime/AGENTS.md](lib/server/runtime/AGENTS.md) — runtimes de modelo (seleção, auth/cliente Codex, capacidades text/tasks; como adicionar um runtime).
+- [lib/server/runtime/AGENTS.md](lib/server/runtime/AGENTS.md) — runtimes de modelo (seleção, auth/cliente Codex, capacidades text, tasks e voice; como adicionar um runtime).
