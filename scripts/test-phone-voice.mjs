@@ -353,7 +353,9 @@ const until = async (check, what, ms = 5000) => {
   phoneReply = () => ({ tools: [{ name: "delegate", args: { request: "Text Jordan I'm late", say: "On it." } }] });
   assert.deepEqual(await V.voiceTurn(turn(OWNER, "Text Jordan I'm running late", call)), { text: "On it." });
   await until(() => messages().some((m) => m.role === "user" && m.text === "Text Jordan I'm late") && asked.slice(before).some((a) => a.codex && !a.phone), "the bot's chat to take the work on the plan");
-  assert.ok(asked.slice(before).every((a) => a.codex), "nothing to OpenAI");
+  // Only this call's requests: a bot turn from an earlier section (a text answered on OpenAI) can still land here.
+  const ours = asked.slice(before).filter((a) => a.phone || JSON.stringify(a.body.input ?? "").includes("Text Jordan I'm late"));
+  assert.ok(ours.length >= 3 && ours.every((a) => a.codex), "nothing to OpenAI");
   V.phoneCallEnded(turn(OWNER, "", call));
   assert.equal((S.getState().usage ?? []).filter((u) => u.kind === "model.tokens" && u.source === "call").length, tokensBefore + 2, "each turn's tokens, as a call's");
   for (const k of ["BOPS_RUNTIME", "CODEX_HOME", "BOPS_CODEX_BASE_URL", "BOPS_PHONE_MODEL"]) delete process.env[k];
