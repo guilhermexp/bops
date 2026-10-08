@@ -17,7 +17,7 @@ const eslintConfig = defineConfig([
     // Release output (the built app) and the downloaded relay agent (scripts/release.sh).
     "dist-desktop/**",
     "vendor/**",
-    // Harness graft helpers (CommonJS hooks).
+    // Agent tooling wiring (graft's hooks), generated and plain CommonJS.
     ".claude/**",
     ".cursor/**",
   ]),

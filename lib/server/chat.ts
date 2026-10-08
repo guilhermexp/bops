@@ -2,9 +2,9 @@ import "server-only";
 import { isSecret, learn, memoryBlock, memoryOn, recall, rememberMessage, saveToMemory, wsOf } from "./memory";
 import { APP_TOOLS, findAppActions, runAppAction } from "./composio";
 import { appsNote, placesNote } from "./skills";
-import { openaiClient } from "./openai-client";
+import { generateText, textOutOfCredit, type ToolCall } from "./runtime/text/index";
 import { contactLine, createBot } from "./bots";
-import { creditsOut, noteOutOfCredit, OUT_OF_CREDIT } from "./cloud";
+import { creditNote, noteOutOfCredit } from "./cloud";
 import { noOwnComputer } from "./plan";
 import { botChatId, live, pairChatId, TAPBACK_EMOJI, TAPBACKS, workspaceOf, type Bot, type Message, type Schedule, type Tapback } from "@/lib/types";
 import { computerBriefing, teamBriefing } from "./briefing";
@@ -21,7 +21,7 @@ import { addMessage, bot, chat, getState, ownerLine, ownerName, patchSession, re
 import { checkEmail, emailOwner, mailOn, readEmail, replyEmail, sendEmail } from "./mail";
 import { isOwner, ownerPhone, textingLine, textOwner } from "./phone";
 import { pingIfWorthIt } from "./attention";
-import { recordTokens } from "./usage";
+import { isCodexSignIn } from "./runtime/codex/auth";
 
 /**
  * Chat engine. Every bot answers in its own chat, like texting a person: it replies, starts
@@ -30,10 +30,8 @@ import { recordTokens } from "./usage";
  * each bot speaks for itself. Bots can tapback instead of replying, and inline replies stay together.
  */
 
-const client = openaiClient();
-const CHAT_MODEL = process.env.BOPS_CHAT_MODEL ?? process.env.BOPS_SAM_MODEL ?? "gpt-6.1-sol";
-/** Texting should feel instant: chat turns mostly reply and route, so they think lightly. Threads think harder. */
-const CHAT_REASONING = { effort: (process.env.BOPS_CHAT_EFFORT ?? "low") as "low" | "medium" | "high" };
+/** Texting should feel instant: chat turns mostly reply and route, so they think lightly. Threads think harder. Empty (as in .env.example) is unset. */
+const CHAT_EFFORT = (process.env.BOPS_CHAT_EFFORT?.trim() || "low") as "low" | "medium" | "high";
 
 const SCHEDULE_PARAMS = {
   type: "object",
@@ -295,18 +293,17 @@ async function acknowledge(b: Bot | undefined, request: string, task: string, pa
   const plain = passTo ? `Passing that to ${passTo}.` : `Adding that to ${task.charAt(0).toLowerCase()}${task.slice(1)}.`;
   try {
     const res = await Promise.race([
-      client.responses
-        .create({
-          model: CHAT_MODEL,
-          reasoning: { effort: "low" },
-          instructions: `You are ${b?.name ?? "a bot"}, texting ${ownerName()} back. They just added something to a task you're already doing${passTo ? ` (${passTo} is doing it; say you'll pass it on)` : ""}. Reply with one short, natural line about what you'll do now, in words that fit what they said, like a friend would text. The task isn't done yet: never give an answer or a result, and never say it's done. No "On it.", no quotes, no emoji, under 12 words.`,
-          input: JSON.stringify({ task, owner_said: request }),
-        })
-        // Counted when it arrives, even after the plain words won the race: it cost the same.
-        .then((r) => (recordTokens("chat", r.model, r.usage, b?.id), r)),
+      // Counted when it arrives (the runtime does), even after the plain words won the race: it cost the same.
+      generateText({
+        role: "chat",
+        effort: "low",
+        instructions: `You are ${b?.name ?? "a bot"}, texting ${ownerName()} back. They just added something to a task you're already doing${passTo ? ` (${passTo} is doing it; say you'll pass it on)` : ""}. Reply with one short, natural line about what you'll do now, in words that fit what they said, like a friend would text. The task isn't done yet: never give an answer or a result, and never say it's done. No "On it.", no quotes, no emoji, under 12 words.`,
+        input: JSON.stringify({ task, owner_said: request }),
+        usage: { source: "chat", botId: b?.id },
+      }),
       new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
     ]);
-    const line = res?.output_text?.trim().replace(/^["“]|["”]$/g, "");
+    const line = res?.text.trim().replace(/^["“]|["”]$/g, "");
     return line && line.length < 160 ? line : plain;
   } catch {
     return plain;
@@ -440,14 +437,14 @@ async function askTeammate(asker: Bot, toId: string, question: string, chatId: s
       keepFrom ? `You were asked by ${owner} to keep things from ${asker.name} (or from the team). Never share those with ${asker.name}, not even a hint; say it's private to ${owner} and ${asker.name} can ask ${owner}:\n${keepFrom}` : "",
       `This is your conversation with ${asker.name} (${asker.role}), your teammate; ${asker.name} asks you things while helping ${owner}. Answer ${asker.name} in one to three plain sentences, from what you know. If you don't know, say so plainly and say how you'd find out. You can't start tasks or ask anyone else here.`,
     ].join("\n");
-    const res = await client.responses.create({
-      model: CHAT_MODEL,
-      reasoning: CHAT_REASONING,
+    const res = await generateText({
+      role: "chat",
+      effort: CHAT_EFFORT,
       instructions,
       input: history(pair, t.id).slice(-16),
+      usage: { source: "chat", botId: t.id },
     });
-    recordTokens("chat", res.model, res.usage, t.id);
-    const answer = tidyAnswer(res.output_text ?? "").text.trim() || "I don't know.";
+    const answer = tidyAnswer(res.text).text.trim() || "I don't know.";
     addMessage({ chatId: pair, role: "bot", botId: t.id, text: answer });
     asked.push({ botId: t.id, question: question.trim(), answer, questionId: q.id });
     return `${t.name} says: ${answer}`;
@@ -469,13 +466,14 @@ type TurnOptions = {
 
 /**
  * One bot reads its chat and replies (or just reacts), starting threads, hand-offs and routines as
- * needed. Returns what it said. Nothing while the user's AI credit is used up: the chat shows that,
- * with Upgrade, and the bot says it once when the credit runs out under it (in its chat only).
+ * needed. Returns what it said. Nothing while the user's AI credit is used up and text goes through
+ * Bops Cloud (textOutOfCredit): the chat shows that, with Upgrade, and the bot says it once when the
+ * credit runs out under it (in its chat only). On the ChatGPT plan, Bops Cloud's credit doesn't count.
  */
 async function botTurn(botId: string, chatId: string, opts: TurnOptions = {}): Promise<string | null> {
   const b = bot(botId);
   if (!b) return null;
-  if (await creditsOut()) return null;
+  if (await textOutOfCredit()) return null;
   const owner = ownerName();
   setTyping(chatId, botId, true);
   try {
@@ -614,17 +612,16 @@ async function botTurn(botId: string, chatId: string, opts: TurnOptions = {}): P
       // Searched only when knowing the user helps with this message (Jev); small talk and plain commands skip it.
       await memoryBlock(workspaceOf(b), lastWords(chatId), 2500, { search: await needsMemory(lastWords(chatId)) }),
     ].join("\n");
-    let response = await client.responses.create({ model: CHAT_MODEL, reasoning: CHAT_REASONING, instructions, input: history(chatId, botId), tools });
-    recordTokens("chat", response.model, response.usage, botId);
+    let response = await generateText({ role: "chat", effort: CHAT_EFFORT, instructions, input: history(chatId, botId), tools, usage: { source: "chat", botId } });
     // App lookups come back to the model before it answers (a few rounds at most). Other tools
     // called along the way (start_task…) are kept and handled with the final answer's.
-    const earlier: typeof response.output = [];
+    const earlier: ToolCall[] = [];
     // Lines for the chat after the reply ("Remembered: …", "Scheduled …").
     const notes: string[] = [];
     // Teammates asked along the way, shown over the reply.
     const asked: NonNullable<Message["asked"]> = [];
     for (let round = 0; round < 6; round++) {
-      const calls = response.output.filter((o) => o.type === "function_call" && LOOKUPS.has(o.name)) as { call_id: string; name: string; arguments: string }[];
+      const calls = response.calls.filter((c) => LOOKUPS.has(c.name));
       if (!calls.length) break;
       const outputs = await Promise.all(
         calls.map(async (c) => {
@@ -676,21 +673,13 @@ async function botTurn(botId: string, chatId: string, opts: TurnOptions = {}): P
                     void ask.then((result) => addMessage({ chatId, role: "system", text: saidNo(result) ? `${b.name} didn't do it: you said no` : `${b.name} did it: ${a.action}` })),
                   (a as { account?: string | null }).account ?? null,
                 ).catch((e: Error) => `Failed: ${e.message}`);
-          return { type: "function_call_output" as const, call_id: c.call_id, output: out };
+          return { call_id: c.call_id, output: out };
         }),
       );
       // Other tools called in the same round (start_task…) are handled below; they just need an output here.
-      const rest = response.output.filter((o) => o.type === "function_call" && !calls.includes(o as never)) as { call_id: string }[];
-      earlier.push(...(rest as never[]));
-      response = await client.responses.create({
-        model: CHAT_MODEL,
-        reasoning: CHAT_REASONING,
-        instructions,
-        previous_response_id: response.id,
-        input: [...outputs, ...rest.map((o) => ({ type: "function_call_output" as const, call_id: o.call_id, output: "ok" }))],
-        tools,
-      });
-      recordTokens("chat", response.model, response.usage, botId);
+      const rest = response.calls.filter((c) => !calls.includes(c));
+      earlier.push(...rest);
+      response = await response.next([...outputs, ...rest.map((o) => ({ call_id: o.call_id, output: "ok" }))]);
     }
 
     // A task started from a message with images: it gets where the images are (files on the user's Mac;
@@ -702,8 +691,8 @@ async function botTurn(botId: string, chatId: string, opts: TurnOptions = {}): P
     const says: string[] = [];
     let reacted = false;
     const pages: string[] = [];
-    for (const item of [...earlier, ...response.output]) {
-      if (item.type !== "function_call" || LOOKUPS.has(item.name)) continue;
+    for (const item of [...earlier, ...response.calls]) {
+      if (LOOKUPS.has(item.name)) continue;
       if (item.name === "make_page") {
         const { title, html } = JSON.parse(item.arguments) as { title: string; html: string };
         pages.push(`[${title.replace(/[[\]]/g, "")}](/api/pages/${savePage(title, html)})`);
@@ -769,7 +758,7 @@ async function botTurn(botId: string, chatId: string, opts: TurnOptions = {}): P
       }
     }
     if (opts.emailBack) for (const id of sessionIds) patchSession(id, { emailBack: opts.emailBack });
-    const tidy = tidyAnswer(response.output_text ?? "");
+    const tidy = tidyAnswer(response.text);
     const text = tidy.text.trim();
     // A tapback can be the whole answer; otherwise there's always something to read.
     const said = text || (sessionIds.length ? says.join(" ") || "Starting on that now." : notes.length ? "Done." : reacted && !pages.length ? null : pages.length ? "Here it is." : "Got it.");
@@ -781,8 +770,9 @@ async function botTurn(botId: string, chatId: string, opts: TurnOptions = {}): P
     for (const n of notes) addMessage({ chatId, role: "system", text: n });
     return reply;
   } catch (e) {
-    // Out of AI credit: said plainly here, and never sent on by email, text or a channel (null).
-    addMessage({ chatId, role: "bot", botId, text: noteOutOfCredit(e) ? OUT_OF_CREDIT : `Something went wrong on my side: ${(e as Error).message}`, replyTo: opts.replyTo });
+    // Out of AI credit (or the ChatGPT plan's limit): said plainly here, and never sent on by email, text
+    // or a channel (null). Codex not signed in with ChatGPT: where to sign in.
+    addMessage({ chatId, role: "bot", botId, text: noteOutOfCredit(e) ? creditNote(e) : isCodexSignIn(e) ? e.message : `Something went wrong on my side: ${(e as Error).message}`, replyTo: opts.replyTo });
     return null;
   } finally {
     setTyping(chatId, botId, false);

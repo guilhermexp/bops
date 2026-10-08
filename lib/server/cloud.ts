@@ -3,6 +3,7 @@ import { APIError } from "openai";
 import { AI_CREDIT_EMPTY, type CloudSession } from "@/cloud/protocol";
 import { loadOrgoKey, orgoKey } from "./orgo-auth";
 import { onPostgres } from "./persist";
+import { isCodexLimit } from "./runtime/codex/client";
 import { getState, update } from "./store";
 
 /**
@@ -161,13 +162,19 @@ export const OUT_OF_CREDIT = "I'm out of AI credit, so I've stopped. Upgrade in 
 
 /**
  * Mark the AI credit used up when `e` says so (state.credits: the chat shows it with Upgrade, and the
- * bots stop asking the cloud for AI work). True when it did.
+ * bots stop asking the cloud for AI work). True when it did. The ChatGPT plan's usage limit (the codex
+ * runtime) counts too, without state.credits: the runtime refuses calls until it resets
+ * (runtime/codex/client.ts), and the bot says whose limit it is and when it's back (creditNote).
  */
 export function noteOutOfCredit(e: unknown): boolean {
+  if (isCodexLimit(e)) return true;
   if (!outOfCredits(e)) return false;
   if (!getState().credits?.out) update((s) => (s.credits = { out: true, at: Date.now() }));
   return true;
 }
+
+/** What a bot says in place of an error noteOutOfCredit took: the plan's limit and when it's back, or OUT_OF_CREDIT. */
+export const creditNote = (e: unknown) => (isCodexLimit(e) ? e.message : OUT_OF_CREDIT);
 
 /** What a bot's work fails with when it doesn't start for want of AI credit (creditsOut). */
 export const outOfCreditError = () => new CloudError(OUT_OF_CREDIT, 402, AI_CREDIT_EMPTY);

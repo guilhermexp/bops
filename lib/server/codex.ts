@@ -8,6 +8,7 @@ import { codexPath, findCodex, installCodex, installStatus } from "./codex-cli";
 import { lowRisk, TALKING_APPS } from "./judgment";
 import { agentEnv } from "./local";
 import { onPostgres } from "./persist";
+import { codexHome } from "./runtime/codex/auth";
 import { addMessage, bot, getState, id, ownerName, update } from "./store";
 
 /**
@@ -22,7 +23,30 @@ import { addMessage, bot, getState, id, ownerName, update } from "./store";
 type Rpc = { id?: number | string; method?: string; params?: Record<string, unknown> & { threadId?: string }; result?: unknown; error?: { message?: string } };
 type Listener = (m: Rpc) => void;
 
-const CODEX_HOME = join(homedir(), ".codex");
+/** The user's Codex config.toml ("" when there's none). */
+function codexConfig() {
+  const path = join(codexHome(), "config.toml");
+  return existsSync(path) ? readFileSync(path, "utf8") : "";
+}
+
+/** The parts of Codex's effective config (config/read) Bops looks at. */
+type EffectiveConfig = { mcp_servers?: Record<string, unknown> | null; plugins?: Record<string, unknown> | null };
+
+/**
+ * What Bops turns off in its threads, and only what the user's Codex setup has: Codex refuses to start
+ * when told to turn off a server it doesn't know ("invalid transport in mcp_servers.cua-driver"). Read
+ * from Codex's own effective config, so any TOML spelling (quoted keys, dotted keys under a parent
+ * table, inline tables) and any config layer counts as Codex counts it.
+ */
+function turnedOff(config: EffectiveConfig | undefined) {
+  return [
+    // Unquoted: `-c` splits its key on dots and keeps quotes as part of the name, so `plugins."composio@composio"` would be another plugin.
+    config?.plugins?.["composio@composio"] && "plugins.composio@composio.enabled=false",
+    config?.mcp_servers?.["cua-driver"] && "mcp_servers.cua-driver.enabled=false",
+    config?.mcp_servers?.cua && "mcp_servers.cua.enabled=false",
+  ].filter((c): c is string => !!c);
+}
+
 /** Apps that, named in a task, mean it belongs on the user's Mac (they can change the list). */
 export const DEFAULT_MAC_RULES = ["Messages", "iMessage", "Notes", "Apple Mail", "Photos", "Finder", "Keynote", "Pages", "Numbers", "Xcode", "Reminders", "my desktop", "my Downloads", "my laptop", "my Mac"];
 
@@ -41,45 +65,60 @@ class Codex {
   login?: { id?: string; until: number };
   loginError?: string;
 
-  /** Start the app server if it isn't running, and say hello. */
+  /**
+   * Start the app server if it isn't running, and say hello. Bops threads run on the user's own Codex
+   * setup, minus a few things it has (turnedOff):
+   * - the Composio plugin, which reaches all their accounts (Bops gives each bot only the apps it
+   *   allows, lib/server/composio.ts);
+   * - other computer-control servers (Cua Driver, Cua Spaces). Codex's own computer use asks the user
+   *   once per app (the cards in Bops); these ask per tool (click, drag, type…), flood them with
+   *   prompts, and follow rules of their own.
+   * Codex says what the setup has (config/read) once it's up; when that includes any of them, it starts
+   * again with them off, before anything runs on it.
+   */
   ready() {
     if (this.proc && this.proc.exitCode === null && this.starting) return this.starting;
     this.starting = (async () => {
-      // Bops threads run on the user's own Codex setup, minus a few things:
-      // - the Composio plugin, which reaches all their accounts (Bops gives each bot only the apps
-      //   it allows, lib/server/composio.ts);
-      // - other computer-control servers (Cua Driver, Cua Spaces). Codex's own computer use asks
-      //   the user once per app (the cards in Bops); these ask per tool (click, drag, type…), flood them
-      //   with prompts, and follow rules of their own.
-      const off = ['plugins."composio@composio".enabled=false', "mcp_servers.cua-driver.enabled=false", "mcp_servers.cua.enabled=false"];
-      const proc = spawn(findCodex() ?? "codex", ["app-server", ...off.flatMap((c) => ["-c", c])], {
-        cwd: homedir(),
-        env: agentEnv({ PATH: codexPath() }),
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-      this.proc = proc;
-      this.buf = "";
-      proc.stdout.setEncoding("utf8");
-      proc.stdout.on("data", (d: string) => this.read(d));
-      proc.stderr.on("data", () => {});
-      proc.on("exit", () => {
-        if (this.proc !== proc) return;
-        this.proc = undefined;
-        for (const p of this.pending.values()) p.rej(new Error("Codex stopped"));
-        this.pending.clear();
-        // Turns it was running can't finish now: end them, so their threads don't wait out a timeout.
-        for (const [threadId, fn] of [...this.listeners]) fn({ method: "turn/completed", params: { threadId, turn: { status: "failed", error: { message: "Codex stopped" } } } as Rpc["params"] });
-        // Anything it was asking about can't be answered anymore, and a sign-in it ran is gone with it.
-        update((state) => state.mac && (state.mac.approvals = []));
-        this.waiting.clear();
-        this.login = undefined;
-      });
-      proc.on("error", () => {});
-      await this.request("initialize", { clientInfo: { name: "bops", title: "Bops", version: "0.1" }, capabilities: { experimentalApi: true, mcpServerOpenaiFormElicitation: true } });
-      this.send({ jsonrpc: "2.0", method: "initialized" });
+      await this.start([]);
+      const read = await this.request<{ config?: EffectiveConfig }>("config/read", { cwd: homedir() });
+      const off = turnedOff(read.config);
+      if (!off.length) return;
+      const first = this.proc;
+      this.proc = undefined;
+      first?.kill();
+      await this.start(off);
     })();
     this.starting.catch(() => (this.starting = undefined));
     return this.starting;
+  }
+
+  /** Run `codex app-server` with these config overrides, and say hello. */
+  private async start(off: string[]) {
+    const proc = spawn(findCodex() ?? "codex", ["app-server", ...off.flatMap((c) => ["-c", c])], {
+      cwd: homedir(),
+      env: agentEnv({ PATH: codexPath() }),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    this.proc = proc;
+    this.buf = "";
+    proc.stdout.setEncoding("utf8");
+    proc.stdout.on("data", (d: string) => this.proc === proc && this.read(d));
+    proc.stderr.on("data", () => {});
+    proc.on("exit", () => {
+      if (this.proc !== proc) return;
+      this.proc = undefined;
+      for (const p of this.pending.values()) p.rej(new Error("Codex stopped"));
+      this.pending.clear();
+      // Turns it was running can't finish now: end them, so their threads don't wait out a timeout.
+      for (const [threadId, fn] of [...this.listeners]) fn({ method: "turn/completed", params: { threadId, turn: { status: "failed", error: { message: "Codex stopped" } } } as Rpc["params"] });
+      // Anything it was asking about can't be answered anymore, and a sign-in it ran is gone with it.
+      update((state) => state.mac && (state.mac.approvals = []));
+      this.waiting.clear();
+      this.login = undefined;
+    });
+    proc.on("error", () => {});
+    await this.request("initialize", { clientInfo: { name: "bops", title: "Bops", version: "0.1" }, capabilities: { experimentalApi: true, mcpServerOpenaiFormElicitation: true } });
+    this.send({ jsonrpc: "2.0", method: "initialized" });
   }
 
   private send(m: object) {
@@ -256,9 +295,9 @@ export async function checkMac() {
     next = "codex";
     reason = failed !== undefined ? `Couldn't install Codex. ${failed}` : "Installing Codex";
   } else {
-    const config = has(join(CODEX_HOME, "config.toml")) ? readFileSync(join(CODEX_HOME, "config.toml"), "utf8") : "";
+    const config = codexConfig();
     const computerUse =
-      has(join(CODEX_HOME, "computer-use", "Codex Computer Use.app")) && /\[plugins\."(unified-)?computer-use@openai-bundled"\]\s*\n\s*enabled\s*=\s*true/.test(config);
+      has(join(codexHome(), "computer-use", "Codex Computer Use.app")) && /\[plugins\."(unified-)?computer-use@openai-bundled"\]\s*\n\s*enabled\s*=\s*true/.test(config);
     try {
       await codex.ready();
       const acct = await codex.request<{ account?: { type?: string; planType?: string } | null }>("account/read", {}, 15_000);

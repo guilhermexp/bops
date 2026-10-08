@@ -1,6 +1,7 @@
 import "server-only";
 import { execFile } from "node:child_process";
 import { openaiClient } from "./openai-client";
+import { generateText } from "./runtime/text/index";
 import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -714,23 +715,16 @@ export async function suggestFor(sessionId: string) {
 /** Two or three replies the user could tap to answer a bot's question, in their words. */
 async function suggestReplies(task: string, recent: Session["replies"], question: string, botId?: string) {
   const owner = ownerName();
-  const res = await client.responses.create({
-    model: process.env.BOPS_CHAT_MODEL ?? "gpt-6.1-sol",
-    reasoning: { effort: "low" },
+  const res = await generateText({
+    role: "chat",
+    effort: "low",
     instructions:
       `A bot asked ${owner} something while working on a task. Suggest 2 or 3 short replies (2 to 8 words each) that ${owner} could tap to answer it, written the way ${owner} would say them. Make them different real answers, not "I don't know". When the question shows the bot misunderstood, include a reply that clears it up. Don't suggest "never mind" or "stop": Bops already has that button. No full stops at the end.`,
     input: JSON.stringify({ task, recent: recent.map((r) => `${r.role === "user" ? owner : "Bot"}: ${r.text}`).join("\n").slice(-3000), question }),
-    text: {
-      format: {
-        type: "json_schema",
-        name: "replies",
-        strict: true,
-        schema: { type: "object", additionalProperties: false, required: ["replies"], properties: { replies: { type: "array", items: { type: "string" } } } },
-      },
-    },
+    json: { name: "replies", schema: { type: "object", additionalProperties: false, required: ["replies"], properties: { replies: { type: "array", items: { type: "string" } } } } },
+    usage: { source: "session", botId },
   });
-  recordTokens("session", res.model, res.usage, botId);
-  const { replies } = JSON.parse(res.output_text) as { replies: string[] };
+  const { replies } = JSON.parse(res.text) as { replies: string[] };
   return replies
     .map((r) => r.trim().replace(/\.$/, ""))
     .filter((r) => r && !/^(never ?mind|stop|cancel)\b/i.test(r))
