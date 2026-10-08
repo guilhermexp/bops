@@ -256,6 +256,10 @@ export type Session = {
   display?: number;
   /** The screen it last held, so a finished session can still show where it left off. */
   lastDisplay?: number;
+  /** The runtime that created this task, kept across replies and server restarts. */
+  taskRuntime?: "openai" | "codex";
+  /** Counted Codex thread usage, so replies and restarts count only new requests. */
+  taskTokens?: { input: number; output: number };
   agentSessionId?: string;
   /** The Agents API environment its executor connects to, kept so a finished thread can pick up again. */
   env?: { id: string; remoteUrl: string };

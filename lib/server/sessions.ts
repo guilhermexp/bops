@@ -1,14 +1,13 @@
 import "server-only";
 import { execFile } from "node:child_process";
-import { openaiClient } from "./openai-client";
+import { tasksRuntime, taskRuntimeId, macTasksRuntime, type TaskThread, type TaskHooks } from "./runtime/tasks/index";
 import { generateText } from "./runtime/text/index";
-import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { BLOCKER_LABEL, botChatId, DISPLAYS, live, MAX_SCREENS, workBot, workspaceOf, type Bot, type Effort, type Session } from "@/lib/types";
-import { creditsOut, executorKey, noteOutOfCredit, OUT_OF_CREDIT, outOfCreditError } from "./cloud";
-import { asNode, browserMcp, cdpPort, currentUrl, ensureChrome, navigate, startExecutor, WORKSPACE } from "./local";
+import { noteOutOfCredit, creditNote, outOfCreditError } from "./cloud";
+import { asNode, cdpPort, currentUrl, ensureChrome, navigate, WORKSPACE } from "./local";
 import { relayNewComputer } from "./relay";
 import { orgo, OrgoError, screenId } from "./orgo";
 import { forgetPlan, makeMainComputer, makeOwnComputer, PlanLimit } from "./plan";
@@ -26,27 +25,12 @@ import { pingIfWorthIt } from "./attention";
 import { emailResult } from "./mail";
 import { textResult } from "./phone";
 import { channelResult } from "./channels";
-import { codex } from "./codex";
 import { chooseWhere, MAC_WORDS } from "./where";
 import { addMessage, bot, getState, id, ownerLine, ownerName, patchSession, session, stateEpoch, update } from "./store";
-import { recordTokens } from "./usage";
 
-/**
- * Session runner. A session is one long-running task on one screen of the computer its bot works on
- * (its own, or the main bot's when it shares; see workComputer in screens.ts),
- * shown in the app as a thread. OpenAI's Agents API runs the agent loop (self_hosted environment)
- * and `codex exec-server` runs its tools: on the user's Mac, Playwright MCP drives the screen's Chrome
- * window; on an Orgo computer, the executor is pinned to the screen's X display and the screen MCP
- * drives it. Each reply the user leaves in the thread becomes the agent's next turn.
- */
+/** Tasks share the session queue and UI; their runtime owns the model and tool loop. */
 
-const client = openaiClient();
-const SESSION_MODEL = process.env.BOPS_SESSION_MODEL ?? "gpt-6.1-sol";
-/** For tasks Jev rates hard: GPT-6 Astra, what OpenAI's dots run on (slower and about 5× the price). */
-const HARD_MODEL = process.env.BOPS_HARD_MODEL ?? "gpt-6-astra";
-/** Helpers a thread can run at once, each on its own screen (a bot has 4). */
 const MAX_HELPERS = 3;
-const TURN_TIMEOUT_MS = 10 * 60_000;
 
 /** Sessions the user stopped (or took over), and how to interrupt each one that's mid-turn. */
 const stopped = new Set<string>();
@@ -232,8 +216,6 @@ export function stopSession(sessionId: string, reason = "Stopped by you") {
   stopped.add(sessionId);
   if (s.status === "queued") patchSession(sessionId, { status: "failed", error: reason, endedAt: Date.now() });
   interrupts.get(sessionId)?.();
-  // On the user's Mac, Codex can always be told directly (the ids are saved on the thread).
-  if (s.runsOn === "mac" && s.codexThread && s.codexTurn) void codex.request("turn/interrupt", { threadId: s.codexThread, turnId: s.codexTurn }).catch(() => {});
 }
 
 /** Stop every task that's queued or running (a reset, or a hosted server about to swap in another user's state). */
@@ -277,6 +259,14 @@ async function pump() {
         if (getState().sessions.filter((x) => x.runsOn === "mac" && (x.status === "starting" || x.status === "running")).length >= MAX_MAC) continue;
         patchSession(s.id, { status: "starting", startedAt: s.startedAt ?? Date.now() });
         void runMac(s.id).finally(() => void pump());
+        continue;
+      }
+      try {
+        tasksRuntime(s.taskRuntime ?? (s.agentSessionId ? "openai" : taskRuntimeId())).assertHost(s.host);
+      } catch (e) {
+        const error = (e as Error).message;
+        patchSession(s.id, { status: "failed", error, endedAt: Date.now() });
+        addMessage({ chatId: s.chatId, role: "bot", botId: s.botId, text: error, sessionIds: [s.id], resultOf: s.id });
         continue;
       }
       if (s.host === "orgo") {
@@ -648,20 +638,6 @@ function instructions(botName: string, role: string, mac: boolean, display: numb
   ].join(" ");
 }
 
-async function startOrgoExecutor(computerId: string, display: number, env: { id: string; remoteUrl: string }) {
-  const key = Buffer.from(await executorKey()).toString("base64");
-  const started = await orgo.bash(
-    computerId,
-    [
-      "mkdir -p /root/.bops && chmod 700 /root/.bops",
-      `echo ${key} | base64 -d > /root/.bops/executor-key-${display} && chmod 600 /root/.bops/executor-key-${display}`,
-      `bops-exec ${display} '${env.id}' '${env.remoteUrl}'`,
-    ].join("\n"),
-    30,
-  );
-  if (started.exit_code !== 0) throw new Error(`executor failed: ${started.output.slice(0, 200)}`);
-}
-
 /**
  * How hard a thread thinks: the bot's own setting, or on "auto" Jev's read of the task. Hard tasks
  * (many steps, research across several sources, careful forms) get high effort; the rest medium.
@@ -818,11 +794,15 @@ async function run(sessionId: string) {
   const mac = s.host === "mac";
   const port = cdpPort(getState().bots.indexOf(b), display);
   const workspace = mac ? WORKSPACE : "/workspace";
-  let executor: ChildProcess | undefined;
+  let thread: TaskThread | undefined;
+  const runtimeId = s.taskRuntime ?? (s.agentSessionId ? "openai" : taskRuntimeId());
+  const runtime = tasksRuntime(runtimeId);
   let unwatch: (() => void) | undefined;
   try {
     // Out of AI credit: it doesn't start (the chat shows that, with Upgrade).
-    if (await creditsOut()) throw outOfCreditError();
+    if (await runtime.outOfCredit()) throw outOfCreditError();
+    runtime.assertHost(s.host);
+    patchSession(sessionId, { taskRuntime: runtimeId });
     step(sessionId, "setup", mac ? "Getting a browser ready on your Mac" : "Getting the computer ready");
     if (mac) await ensureChrome(b.id, port);
     else {
@@ -848,93 +828,35 @@ async function run(sessionId: string) {
     const endpoint = screenEndpoint(b, display);
     if (endpoint) unwatch = watchScreen(b.id, display, endpoint, sessionId);
 
-    // A thread picks its agent session back up; a new one gets a fresh agent session.
-    const resuming = !!(s.agentSessionId && s.env);
-    if (!resuming) {
-      const effort = await threadEffort(b.effort, s.goal);
-      patchSession(sessionId, { effort });
-      // What's known about the user that bears on this task (long-term memory).
-      const memory = await memoryBlock(wsOf(s.botId), s.goal, 3000);
-      const created = (await client.beta.agents.sessions.create({
-        agent: {
-          // Hard tasks get the model Dots runs on; the rest the faster, cheaper one.
-          model: session(sessionId)!.effort === "high" ? HARD_MODEL : SESSION_MODEL,
-          // Reasoning summaries become the thread's live caption ("checking the pricing page…").
-          reasoning: { effort: session(sessionId)!.effort ?? "medium", summary: "auto" },
-          // Its apps reach Bops from an Orgo computer over the tailnet (screen_mcp.py, when its key file
-          // went on: ensureScreenTools), never from a Chrome thread on the Mac.
-          instructions: [
-            instructions(b.name, b.role, mac, display, c.id !== b.id ? c.name : undefined, !mac && !!appsReach.get(computerId) && accountsOf(b).length > 0),
-            appsNote(b, "task", { tools: !mac && !!appsReach.get(computerId) }),
-            placesNote(b, "task"),
-            memory,
-          ]
-            .filter(Boolean)
-            .join("\n\n"),
-          tools: [
-            // Text research: search, open a page, find in a page.
-            { type: "web_search", mode: "live", context_size: "medium" },
-            // On a cloud computer, the browser tools too: they read and drive the Chrome on the task's screen (over CDP).
-            ...(mac
-              ? []
-              : [
-                  {
-                    type: "mcp",
-                    server_label: "browser",
-                    transport: {
-                      type: "stdio",
-                      command: "/usr/bin/node",
-                      args: [BROWSER_MCP, "--cdp-endpoint", `http://127.0.0.1:${9200 + display}`, "--init-page", BROWSER_FRONT],
-                      cwd: "/workspace",
-                    },
-                    required: false,
-                  },
-                ]),
-            {
-              type: "mcp",
-              server_label: mac ? "browser" : "screen",
-              transport: mac
-                ? browserMcp(port)
-                : {
-                    type: "stdio",
-                    command: "/opt/bops/venv/bin/python",
-                    args: ["/opt/bops/screen_mcp.py", "stdio", "--session", sessionId, "--bot", b.id],
-                    cwd: "/workspace",
-                    env_vars: ["DISPLAY"],
-                  },
-              required: true,
-            },
-          ],
-          // Orgo threads can split into helpers (subagents), each on a screen of its own; see screen_mcp.py.
-          ...(mac ? {} : { multi_agent: { enabled: true, max_concurrent_subagents: MAX_HELPERS } }),
-        },
-        environment: {
-          type: "self_hosted",
-          workspace_directory: workspace,
-          capability_directories: [`${workspace}/capabilities/skills`],
-        },
-      } as never)) as unknown as { id: string; environment: { id: string; remote_url: string } };
-      patchSession(sessionId, { agentSessionId: created.id, env: { id: created.environment.id, remoteUrl: created.environment.remote_url } });
-    }
-    const { agentSessionId, env } = session(sessionId)! as Required<Pick<Session, "agentSessionId" | "env">>;
-
-    if (mac) executor = await startExecutor(env.id, env.remoteUrl, port);
-    else await startOrgoExecutor(computerId, display, env);
+    const resume = runtimeId === "codex" ? s.codexThread ? { id: s.codexThread, tokens: s.taskTokens } : undefined : s.agentSessionId && s.env ? { id: s.agentSessionId, env: s.env } : undefined;
+    const resuming = !!resume;
+    const effort = s.effort ?? await threadEffort(b.effort, s.goal);
+    patchSession(sessionId, { effort });
+    const memory = await memoryBlock(wsOf(s.botId), s.goal, 3000);
+    thread = await runtime.open({
+      effort, botId: b.id, resume,
+      opened: (opened) => patchSession(sessionId, runtimeId === "codex" ? { codexThread: opened.id } : { agentSessionId: opened.id, env: opened.env }),
+      place: mac ? { host: "mac", cdpPort: port, workspace } : { host: "orgo", computerId, display, sessionId, botId: b.id, workspace },
+      instructions: [
+        instructions(b.name, b.role, mac, display, c.id !== b.id ? c.name : undefined, !mac && !!appsReach.get(computerId) && accountsOf(b).length > 0),
+        appsNote(b, "task", { tools: !mac && !!appsReach.get(computerId) }), placesNote(b, "task"), memory,
+      ].filter(Boolean).join("\n\n"),
+    });
+    patchSession(sessionId, runtimeId === "codex" ? { codexThread: thread.id } : { agentSessionId: thread.id, env: thread.env });
     step(sessionId, "setup", "At the computer");
     // The cursor says something from the first moment; Jev's read of the steps takes over from here.
     patchSession(sessionId, { status: "running", activity: "getting started" });
 
     // First turn is the kickoff; every later turn is whatever the user replied in the thread.
-    let input: string | undefined = resuming ? takeReplies(sessionId) : session(sessionId)!.goal;
-    const seen = new Set<string>();
+    let input: string | undefined = resuming ? takeReplies(sessionId) ?? (!s.answer ? s.goal : undefined) : session(sessionId)!.goal;
     while (input) {
       if (stopped.has(sessionId)) throw new Error("Stopped by you");
       // A new turn starts clean; the screen watch raises the blocker again if it's still there.
       patchSession(sessionId, { blocker: undefined });
       const brief = await computerBriefing(b.id, { thread: sessionId }).catch(() => "");
       patchSession(sessionId, { options: undefined });
-      await runTurn(sessionId, agentSessionId, withBriefing(input, brief), seen);
-      const { text: answer, options } = tidyAnswer(await finalAnswer(agentSessionId));
+      const { text: answer, options } = tidyAnswer(await runtime.turn({ thread, input: withBriefing(input, brief), effort, botId: b.id, epoch: stateEpoch(), sessionId, hooks: taskHooks(sessionId) }));
+      if (stopped.has(sessionId)) throw new Error("Stopped by you");
       patchSession(sessionId, { options });
       patchSession(sessionId, (x) => {
         x.answer = answer;
@@ -965,10 +887,10 @@ async function run(sessionId: string) {
       return;
     }
     const credit = !stopped.has(sessionId) && noteOutOfCredit(e);
-    const error = stopped.has(sessionId) ? (getState().takeover?.sessionId === sessionId ? "Paused while you took over" : "Stopped by you") : credit ? OUT_OF_CREDIT : (e as Error).message;
+    const error = stopped.has(sessionId) ? (getState().takeover?.sessionId === sessionId ? "Paused while you took over" : "Stopped by you") : credit ? creditNote(e) : (e as Error).message;
     patchSession(sessionId, { status: "failed", error, endedAt: Date.now() });
     // Out of AI credit: said once, plainly, in the chat only (never by email, text or a channel).
-    if (credit) addMessage({ chatId: s.chatId, role: "bot", botId: b.id, text: OUT_OF_CREDIT, sessionIds: [sessionId], resultOf: sessionId });
+    if (credit) addMessage({ chatId: s.chatId, role: "bot", botId: b.id, text: creditNote(e), sessionIds: [sessionId], resultOf: sessionId });
     else if (!stopped.has(sessionId)) {
       const failed = addMessage({ chatId: s.chatId, role: "bot", botId: b.id, text: `I couldn't finish ${s.title}: ${error}`, sessionIds: [sessionId], resultOf: sessionId });
       emailResult(s, failed.id, failed.text);
@@ -979,13 +901,12 @@ async function run(sessionId: string) {
     unwatch?.();
     interrupts.delete(sessionId);
     patchSession(sessionId, { helperScreens: undefined, helperTasks: undefined, helperOrder: undefined });
-    if (mac) executor?.kill();
-    else {
-      const envId = session(sessionId)?.env?.id;
+    if (thread) await runtime.close(thread);
+    if (!mac && runtimeId === "openai") {
       await orgo
         .bash(
           computerId,
-          `${envId ? `pkill -f "[e]nvironment-id ${envId}"; ` : ""}rm -f /root/.bops/executor-key-${display}; bops-screens release thread:${sessionId}${
+          `bops-screens release thread:${sessionId}${
             s.onWatch && getState().watches?.some((w) => w.id === s.onWatch) ? `; bops-screens claim watch:${s.onWatch} ${screenNo(display)}` : ""
           }`,
           15,
@@ -1055,41 +976,26 @@ function watchFrontApp(sessionId: string) {
 async function runMac(sessionId: string) {
   const s = session(sessionId)!;
   const b = bot(s.botId)!;
-  let threadId = s.codexThread;
+  let thread: TaskThread | undefined;
   const unwatchApps = watchFrontApp(sessionId);
+  const runtime = macTasksRuntime();
   try {
     // Out of AI credit: it doesn't start (the chat shows that, with Upgrade).
-    if (await creditsOut()) throw outOfCreditError();
     step(sessionId, "setup", "Getting ready on your Mac");
-    await codex.ready();
     // The bot's apps come through Bops (vm/apps-mcp.mjs), with only the access the user gave it.
-    const apps = composioOn() && accountsOf(b).length
-      ? {
-          mcp_servers: {
-            bops_apps: {
-              command: process.execPath,
-              args: [join(process.cwd(), "vm/apps-mcp.mjs"), "--session", sessionId],
-              env: { BOPS_URL: `http://127.0.0.1:${process.env.PORT ?? 3210}`, BOPS_KEY: appsKeyFor(b.id), ...(asNode ? { ELECTRON_RUN_AS_NODE: "1" } : {}) },
-              tool_timeout_sec: 1200,
-            },
-          },
-        }
-      : undefined;
+    const apps = composioOn() && accountsOf(b).length ? {
+      command: process.execPath, args: [join(process.cwd(), "vm/apps-mcp.mjs"), "--session", sessionId],
+      env: { BOPS_URL: `http://127.0.0.1:${process.env.PORT ?? 3210}`, BOPS_KEY: appsKeyFor(b.id), ...(asNode ? { ELECTRON_RUN_AS_NODE: "1" } : {}) },
+    } : undefined;
     const memory = await memoryBlock(wsOf(s.botId), s.goal, 3000);
-    const settings = {
-      approvalPolicy: "on-request",
-      approvalsReviewer: "user",
-      sandbox: "read-only",
-      cwd: WORKSPACE,
-      developerInstructions: [macInstructions(b.name, b.isMain ? "chief of staff" : b.role), appsNote(b, "task", { tools: !!apps }), placesNote(b, "task"), memory].filter(Boolean).join("\n\n"),
-      ...(apps ? { config: apps } : {}),
-    };
-    if (threadId) await codex.request("thread/resume", { threadId, ...settings }).catch(() => (threadId = undefined));
-    if (!threadId) {
-      const started = await codex.request<{ thread: { id: string } }>("thread/start", { ...settings, serviceName: "Bops" });
-      threadId = started.thread.id;
-      patchSession(sessionId, { codexThread: threadId });
-    }
+    const effort = s.effort ?? await threadEffort(b.effort, s.goal);
+    patchSession(sessionId, { effort });
+    thread = await runtime.open({
+      botId: b.id, effort, native: true, apps, place: { host: "mac", cdpPort: 0, workspace: WORKSPACE },
+      resume: s.codexThread ? { id: s.codexThread, tokens: s.taskTokens } : undefined,
+      instructions: [macInstructions(b.name, b.isMain ? "chief of staff" : b.role), appsNote(b, "task", { tools: !!apps }), placesNote(b, "task"), memory].filter(Boolean).join("\n\n"),
+    });
+    patchSession(sessionId, { codexThread: thread.id });
     step(sessionId, "setup", "On your Mac");
     patchSession(sessionId, { status: "running", activity: "getting started" });
 
@@ -1099,7 +1005,7 @@ async function runMac(sessionId: string) {
       patchSession(sessionId, { blocker: undefined });
       const brief = await computerBriefing(b.id, { thread: sessionId }).catch(() => "");
       patchSession(sessionId, { options: undefined });
-      const { text: answer, options } = tidyAnswer(await macTurn(sessionId, threadId!, withBriefing(input, brief)));
+      const { text: answer, options } = tidyAnswer(await runtime.turn({ thread, input: withBriefing(input, brief), effort, botId: b.id, epoch: stateEpoch(), sessionId, hooks: taskHooks(sessionId) }));
       patchSession(sessionId, { options });
       if (stopped.has(sessionId)) throw new Error("Stopped by you");
       patchSession(sessionId, (x) => {
@@ -1121,9 +1027,9 @@ async function runMac(sessionId: string) {
     channelResult(done, done.answer ?? "Done.");
   } catch (e) {
     const credit = !stopped.has(sessionId) && noteOutOfCredit(e);
-    const error = stopped.has(sessionId) ? "Stopped by you" : credit ? OUT_OF_CREDIT : (e as Error).message;
+    const error = stopped.has(sessionId) ? "Stopped by you" : credit ? creditNote(e) : (e as Error).message;
     patchSession(sessionId, { status: "failed", error, endedAt: Date.now(), activity: undefined, codexTurn: undefined });
-    if (credit) addMessage({ chatId: s.chatId, role: "bot", botId: b.id, text: OUT_OF_CREDIT, sessionIds: [sessionId], resultOf: sessionId });
+    if (credit) addMessage({ chatId: s.chatId, role: "bot", botId: b.id, text: creditNote(e), sessionIds: [sessionId], resultOf: sessionId });
     else if (!stopped.has(sessionId)) {
       const failed = addMessage({ chatId: s.chatId, role: "bot", botId: b.id, text: `I couldn't finish ${s.title} on your Mac: ${error}`, sessionIds: [sessionId], resultOf: sessionId });
       emailResult(s, failed.id, failed.text);
@@ -1133,67 +1039,27 @@ async function runMac(sessionId: string) {
   } finally {
     unwatchApps();
     interrupts.delete(sessionId);
-    if (threadId) codex.off(threadId);
+    if (thread) await runtime.close(thread);
   }
 }
 
-/** One Codex turn: stream its actions into the thread, and return its last word. */
-function macTurn(sessionId: string, threadId: string, input: string) {
-  return new Promise<string>((resolve, reject) => {
-    let last = "";
-    let turnId: string | undefined;
-    const timer = setTimeout(() => finish(new Error("Codex took too long on this step")), TURN_TIMEOUT_MS);
-    const finish = (err?: Error) => {
-      clearTimeout(timer);
-      codex.off(threadId);
-      if (err) return reject(err);
-      patchSession(sessionId, (x) => {
-        const end = x.steps.at(-1);
-        if (end?.tool === "note" && end.detail === last) x.steps.pop();
-      });
-      resolve(last || "Done.");
-    };
-    codex.on(threadId, (m) => {
-      const item = (m.params as { item?: { type?: string; text?: string; tool?: string; server?: string; arguments?: { title?: string; code?: string; pid?: number; window_id?: number; bundle_id?: string; app?: string; name?: string }; command?: string | string[] } })?.item;
-      if (m.method === "item/started" && item?.type === "mcpToolCall") {
-        // The apps it reaches for (cua.getApp("Calculator")), so the user can watch those windows.
-        // (A bundle id like com.apple.calculator becomes its last part, which matches the app's name.)
-        const apps = [...(item.arguments?.code ?? "").matchAll(/getApp\(\s*["'`]([^"'`]+)["'`]/g)].map((x) => (/^[a-z]+(\.[\w-]+){2,}$/i.test(x[1]) ? x[1].split(".").at(-1)! : x[1]));
-        if (apps.length) patchSession(sessionId, (x) => void (x.macApps = [...(x.macApps ?? []).filter((a) => !apps.includes(a)), ...apps].slice(-4)));
-        // Tools that name a window or an app (Cua Driver's window_id / pid / bundle_id): the exact
-        // window it's working in, and the app's name.
-        noteMacTarget(sessionId, item.arguments ?? {});
-        const what = item.arguments?.title || `used ${item.tool}`;
-        step(sessionId, item.server === "cua_repl" ? "computer" : (item.tool ?? "tool"), what);
-        patchSession(sessionId, { activity: what.slice(0, 40).toLowerCase() });
-      } else if (m.method === "item/started" && item?.type === "commandExecution") {
-        step(sessionId, "command", `ran ${Array.isArray(item.command) ? item.command.join(" ") : (item.command ?? "a command")}`.slice(0, 120));
-      } else if (m.method === "item/completed" && item?.type === "agentMessage" && item.text) {
-        // Narration goes in as it comes; the last message is the answer, so it comes back out at the end.
-        step(sessionId, "note", item.text);
-        last = item.text;
-      } else if (m.method === "turn/completed") {
-        const turn = (m.params as { turn?: { status?: string; error?: { message?: string } } })?.turn;
-        if (turn?.status === "failed") finish(new Error(turn.error?.message ?? "Codex couldn't finish"));
-        else if (turn?.status === "interrupted") finish(new Error("Stopped by you"));
-        else finish();
-      } else if (m.method === "error") {
-        const msg = (m.params as { error?: { message?: string } })?.error?.message;
-        if (msg && !(m.params as { willRetry?: boolean })?.willRetry) finish(new Error(msg));
-      }
-    });
-    codex
-      .request<{ turn: { id: string } }>("turn/start", { threadId, input: [{ type: "text", text: input }] })
-      .then((r) => {
-        turnId = r.turn.id;
-        patchSession(sessionId, { codexTurn: turnId });
-        const stop = () => void codex.request("turn/interrupt", { threadId, turnId }).catch(() => {});
-        interrupts.set(sessionId, stop);
-        // Stopped while the turn was starting: stop it now.
-        if (stopped.has(sessionId)) stop();
-      })
-      .catch((e: Error) => finish(e));
-  });
+function taskHooks(sessionId: string): TaskHooks {
+  return {
+    step: (tool, detail, by) => step(sessionId, tool, detail, by),
+    removeLastNote: (text) => patchSession(sessionId, (x) => {
+      const last = x.steps.at(-1);
+      if (last?.tool === "note" && last.detail === text) x.steps.pop();
+    }),
+    caption: (activity) => patchSession(sessionId, { activity }),
+    isStopped: () => stopped.has(sessionId),
+    bindStop: (stop) => interrupts.set(sessionId, stop),
+    tokens: (taskTokens) => patchSession(sessionId, { taskTokens }),
+    turnId: (codexTurn) => patchSession(sessionId, { codexTurn }),
+    computer: (apps, target) => {
+      if (apps.length) patchSession(sessionId, (x) => void (x.macApps = [...(x.macApps ?? []).filter((a) => !apps.includes(a)), ...apps].slice(-4)));
+      noteMacTarget(sessionId, target);
+    },
+  };
 }
 
 function takeReplies(sessionId: string): string | undefined {
@@ -1201,264 +1067,6 @@ function takeReplies(sessionId: string): string | undefined {
   if (!pending.length) return undefined;
   patchSession(sessionId, (x) => x.replies.forEach((r) => r.role === "user" && (r.delivered = true)));
   return pending.map((r) => r.text).join("\n");
-}
-
-async function runTurn(sessionId: string, agentSessionId: string, input: string, seen: Set<string>) {
-  const stream = await client.beta.agents.sessions.events.stream(agentSessionId);
-  interrupts.set(sessionId, () => stream.controller.abort());
-  await client.beta.agents.sessions.events.create(agentSessionId, {
-    events: [{ type: "agent.session.input.message", input: [{ role: "user", content: [{ type: "input_text", text: input }] }] }],
-  } as never);
-
-  const poll = setInterval(() => void syncSteps(sessionId, agentSessionId, seen), 2500);
-  const timeout = setTimeout(() => stream.controller.abort(), TURN_TIMEOUT_MS);
-  let failure: string | undefined = "The session ended without finishing";
-  // Which turns are helpers', so items streamed live can be credited to them.
-  const turnOwner = new Map<string, string | null>();
-  // Each turn's tokens (the thread's and its helpers'), counted once when it ends; `seen` keeps it once.
-  const s = session(sessionId);
-  const model = s?.effort === "high" ? HARD_MODEL : SESSION_MODEL;
-  // Whose state this turn belongs to: tokens counted after a hosted server swapped users are dropped (stateEpoch).
-  const epoch = stateEpoch();
-  const countTurn = (turnId: string, usage: TokenCount) => {
-    if (!usage || seen.has(`turn:${turnId}`)) return;
-    seen.add(`turn:${turnId}`);
-    recordTokens("session", model, usage, s?.botId, epoch);
-  };
-  try {
-    for await (const event of stream as AsyncIterable<{
-      type: string;
-      turn_id?: string | null;
-      item?: Item;
-      turn?: { subagent_id?: string | null; error?: { message?: string }; usage?: TokenCount };
-      subagent?: { id: string; name: string | null };
-      usage?: TokenCount;
-    }>) {
-      if (event.type === "agent.session.turn.created" && event.turn_id) turnOwner.set(event.turn_id, event.turn?.subagent_id ?? null);
-      if (/^agent\.session\.turn\.(completed|failed|cancelled)$/.test(event.type) && event.turn_id) countTurn(event.turn_id, event.usage ?? event.turn?.usage);
-      // A helper's name the moment it starts, so its work (and the screen it's on) is credited to it right away.
-      if (event.type === "agent.session.subagent.created" && event.subagent?.name) {
-        const { id: helperId, name } = event.subagent;
-        helperNameById.set(helperId, name);
-        patchSession(sessionId, (x) => {
-          if (!x.helperNames?.includes(name)) x.helperNames = [...(x.helperNames ?? []), name];
-        });
-      }
-      // Steps as they happen: the items list only fills in once a turn is over, so polling alone left
-      // threads looking idle (and their captions stale) until the end.
-      if (event.type === "agent.session.turn.item.done" && event.item) {
-        const sub = event.turn_id ? turnOwner.get(event.turn_id) : null;
-        const who = sub ? helperNameById.get(sub) : undefined;
-        // A helper's item before its name is known waits for the next poll, so it's never shown as the thread's own.
-        if (!sub || who) {
-          const changed = recordItem(sessionId, event.item, seen, who);
-          if (changed) void syncHelperScreens(sessionId);
-        }
-      }
-      const root = !event.turn?.subagent_id;
-      if (event.type === "agent.session.turn.completed" && root) {
-        failure = undefined;
-        break;
-      }
-      if ((event.type === "agent.session.turn.failed" && root) || event.type === "agent.session.failed" || event.type === "agent.session.environment.failed") {
-        failure = event.turn?.error?.message ?? event.type;
-        break;
-      }
-    }
-  } catch (e) {
-    failure = stopped.has(sessionId) ? "Stopped by you" : (e as Error).name === "AbortError" ? "Timed out after 10 minutes" : (e as Error).message;
-  } finally {
-    clearInterval(poll);
-    clearTimeout(timeout);
-    stream.controller.abort();
-  }
-  // Turns that end out of sight (a helper finishing after the thread, a timeout, a stop: the turn
-  // keeps running on the server) are looked up until they finish, off the hot path.
-  for (const turnId of turnOwner.keys())
-    if (!seen.has(`turn:${turnId}`)) {
-      seen.add(`turn:${turnId}`);
-      settleTurn(turnId, agentSessionId, model, s?.botId, epoch);
-    }
-  await syncSteps(sessionId, agentSessionId, seen);
-  if (failure) throw new Error(failure);
-}
-
-/** Turns being looked up until they finish, so each is counted once even across runs. */
-const settling = new Set<string>();
-/** Waits between lookups of a turn that hasn't finished: about two hours in all, then it's dropped. */
-const SETTLE_WAITS_MS = [15_000, 30_000, 60_000, 120_000, ...Array<number>(28).fill(240_000)];
-
-/** Record a turn's tokens once it reaches its end, asking again (further apart each time) while it runs. */
-function settleTurn(turnId: string, agentSessionId: string, model: string, botId: string | undefined, epoch: number, attempt = 0) {
-  if (attempt === 0 && settling.has(turnId)) return;
-  settling.add(turnId);
-  const retry = () => {
-    // Another user's state is in memory now (hosted): this turn's tokens aren't theirs, so stop asking.
-    if (epoch !== stateEpoch()) settling.delete(turnId);
-    else if (attempt < SETTLE_WAITS_MS.length) setTimeout(() => settleTurn(turnId, agentSessionId, model, botId, epoch, attempt + 1), SETTLE_WAITS_MS[attempt]).unref?.();
-    else settling.delete(turnId);
-  };
-  client.beta.agents.sessions.turns
-    .retrieve(turnId, { session_id: agentSessionId })
-    .then((t) => {
-      if (!["completed", "failed", "cancelled"].includes(t.status)) return retry();
-      settling.delete(turnId);
-      recordTokens("session", model, t.usage, botId, epoch);
-    })
-    .catch(retry);
-}
-
-/** An agent turn's tokens, as the Agents API reports them (null when it doesn't know). */
-type TokenCount = { input_tokens: number; output_tokens: number } | null | undefined;
-
-type Item = {
-  id: string;
-  type: string;
-  turn_id?: string;
-  role?: string;
-  phase?: string;
-  name?: string;
-  arguments?: Record<string, unknown>;
-  content?: { type: string; text?: string }[];
-  output?: { content?: { type: string; text?: string }[] } | string | null;
-  /** A web search's action: search (query), open_page (url), find_in_page (pattern in url). */
-  action?: { type: string; query?: string; queries?: string[]; url?: string; pattern?: string } | null;
-  /** A shell command it ran. */
-  command?: string;
-  /** Reasoning summaries: what it's thinking about, in a line or two. */
-  summary?: { text: string }[];
-};
-
-/** Mirror the agent's screen actions and narration into the thread. */
-/**
- * Mirror the agent's screen actions and narration into the thread, including its helpers' (each
- * subagent keeps its own history; their steps are labelled with the helper's name and the screen
- * it acted on), and keep the thread's record of helper screens in step with the computer's ledger.
- */
-const closedHelpers = new Set<string>();
-/** Helpers' names by subagent id, learned when listing them, so live items can say who did them. */
-const helperNameById = new Map<string, string>();
-
-/** Turn one finished item into a thread step (once). True when it changed who holds which screen. */
-function recordItem(sessionId: string, item: Item, seen: Set<string>, who?: string) {
-  if (seen.has(item.id)) return false;
-  seen.add(item.id);
-  const screen = typeof item.arguments?.screen === "number" ? item.arguments.screen : undefined;
-  if (item.type === "mcp_call") step(sessionId, item.name ?? "tool", describe(item.name, item.arguments), { who, screen });
-  // Each helper's screen, in the order they start (so names line up), and its job as Sam named it.
-  if (item.type === "mcp_call" && item.name === "claim_screen") {
-    const out = typeof item.output === "string" ? item.output : (item.output?.content ?? []).map((c) => c.text ?? "").join(" ");
-    const n = Number(out.match(/Screen (\d) is yours/)?.[1]);
-    const task = typeof item.arguments?.task === "string" ? item.arguments.task.trim().slice(0, 60) : "";
-    if (n)
-      patchSession(sessionId, (x) => {
-        const d = DISPLAYS[n - 1];
-        x.helperOrder = [...(x.helperOrder ?? []).filter((y) => y !== d), d];
-        if (task) x.helperTasks = { ...x.helperTasks, [d]: task };
-      });
-  }
-  else if (item.type === "web_search_call") step(sessionId, "search", describeSearch(item.action), { who });
-  else if (item.type === "command_execution") step(sessionId, "command", `ran ${String(item.command ?? "a command").slice(0, 100)}`, { who });
-  // What it's thinking, as the thread's live caption (the thread's own, not its helpers').
-  else if (item.type === "reasoning" && !who && item.summary?.length) {
-    const line = item.summary.map((x) => x.text).join(" ").replace(/\*\*/g, "").split(/(?<=[.!?])\s/)[0].trim();
-    if (line) patchSession(sessionId, { activity: line.charAt(0).toLowerCase() + line.slice(1, 60).replace(/[.!?]$/, "") });
-  }
-  else if (item.type === "create_subagent_call") step(sessionId, "helper", "started a helper", { who });
-  else if (item.type === "wait_for_subagents_call") step(sessionId, "helper", "waiting for helpers", { who });
-  else if (item.type === "message" && item.role === "assistant" && item.phase === "commentary")
-    step(sessionId, "note", item.content?.map((c) => c.text).join(" ") ?? "", { who });
-  return item.type === "mcp_call" && (item.name === "claim_screen" || item.name === "release_screen");
-}
-
-async function syncSteps(sessionId: string, agentSessionId: string, seen: Set<string>) {
-  try {
-    const record = (item: Item, who?: string) => recordItem(sessionId, item, seen, who);
-
-    const items: Item[] = [];
-    for await (const item of client.beta.agents.sessions.items.list(agentSessionId) as AsyncIterable<Item>) items.push(item);
-    let ledgerChanged = false;
-    let started = false;
-    for (const item of items.reverse().filter((i) => !seen.has(i.id))) {
-      ledgerChanged = record(item) || ledgerChanged;
-      started ||= item.type === "create_subagent_call";
-    }
-
-    // Helpers, by name, and whatever they've done since the last look.
-    const known = session(sessionId)?.helperNames ?? [];
-    if (started || known.length) {
-      const helpers: { id: string; name: string; status: string }[] = [];
-      for await (const h of client.beta.agents.sessions.subagents.list(agentSessionId) as AsyncIterable<{ id: string; name: string; status: string }>) helpers.push(h);
-      helpers.reverse();
-      for (const h of helpers) helperNameById.set(h.id, h.name);
-      const names = helpers.map((h) => h.name);
-      if (names.join() !== known.join()) patchSession(sessionId, { helperNames: names });
-      for (const h of helpers) {
-        if (closedHelpers.has(h.id)) continue;
-        const theirs: Item[] = [];
-        for await (const item of client.beta.agents.sessions.subagents.items.list(h.id, { session_id: agentSessionId, order: "asc" }) as AsyncIterable<Item>)
-          theirs.push(item);
-        for (const item of theirs.filter((i) => !seen.has(i.id))) record(item, h.name);
-        if (h.status !== "active") closedHelpers.add(h.id);
-      }
-    }
-    if (ledgerChanged) await syncHelperScreens(sessionId);
-  } catch {
-    /* transient; the next poll catches up */
-  }
-}
-
-/** Read which screens this thread's helpers hold from the computer's screen ledger. */
-async function syncHelperScreens(sessionId: string) {
-  const s = session(sessionId);
-  const b = s && bot(s.botId);
-  const computerId = b && workComputer(b).computerId;
-  if (!computerId) return;
-  const out = await orgo.bash(computerId, "bops-screens list", 15);
-  const ledger = JSON.parse(out.output.trim() || "{}") as Record<string, string>;
-  const helperScreens = Object.entries(ledger)
-    .filter(([, owner]) => owner === `helper:${sessionId}`)
-    .map(([n]) => DISPLAYS[Number(n) - 1]);
-  patchSession(sessionId, { helperScreens });
-}
-
-async function finalAnswer(agentSessionId: string) {
-  // The session's own items are the thread's; helpers keep theirs separately and report back to it.
-  for await (const item of client.beta.agents.sessions.items.list(agentSessionId) as AsyncIterable<Item>)
-    if (item.type === "message" && item.role === "assistant" && item.phase === "final_answer")
-      return item.content?.map((c) => c.text).join(" ").trim() || "Done.";
-  return "Done.";
-}
-
-function describeSearch(a?: Item["action"]) {
-  if (a?.type === "open_page" && a.url) return `read ${a.url.replace(/^https?:\/\/(www\.)?/, "").slice(0, 70)}`;
-  if (a?.type === "find_in_page") return `looked for "${String(a.pattern ?? "").slice(0, 40)}" in the page`;
-  const q = a?.query ?? a?.queries?.join(", ");
-  return q ? `searched "${q.slice(0, 70)}"` : "searched the web";
-}
-
-function describe(tool?: string, args?: Record<string, unknown>) {
-  if (tool === "claim_screen") return args?.task ? `brought in a helper for ${String(args.task).slice(0, 60)}` : "brought in a helper";
-  if (tool === "release_screen") return "a helper finished";
-  if (tool === "screenshot" || tool === "browser_take_screenshot") return "looked at the screen";
-  if (tool === "move") return "moved the pointer";
-  if (tool === "wait" || tool === "browser_wait_for") return "waited for the page";
-  if (tool === "drag") return "dragged";
-  if (!args) return tool ?? "";
-  if (tool === "type_text") return `typed "${String(args.text).slice(0, 60)}"`;
-  if (tool === "key") return `pressed ${args.keys}`;
-  if (tool === "click") return `clicked (${args.x}, ${args.y})`;
-  if (tool === "scroll") return `scrolled ${args.direction}`;
-  if (tool === "browser_navigate") return `opened ${args.url}`;
-  if (tool === "browser_click") return `clicked ${args.element ?? args.ref}`;
-  if (tool === "browser_type") return `typed "${String(args.text).slice(0, 60)}"`;
-  if (tool === "browser_press_key") return `pressed ${args.key}`;
-  if (tool === "browser_snapshot") return "read the page";
-  if (tool === "browser_fill_form") return "filled in the form";
-  if (tool === "browser_select_option") return `picked ${Array.isArray(args.values) ? args.values.join(", ") : "an option"}`;
-  if (tool === "browser_tabs") return `${args.action ?? "switched"} a tab`;
-  if (tool === "browser_hover") return `hovered ${args.element ?? ""}`.trim();
-  return tool ?? "";
 }
 
 /* ---------------- Take over ---------------- */

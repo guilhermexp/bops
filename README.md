@@ -86,7 +86,7 @@ Everything runs on your Mac except the bots' computers and the providers. `edge/
 ## Requirements
 
 - macOS on Apple Silicon, Node 22 or newer.
-- **Required:** an OpenAI API key and an Orgo account. Text (chat, phone turns) can run on your ChatGPT plan instead: see [Model runtimes](#model-runtimes).
+- **Required:** an OpenAI API key and an Orgo account. Text (chat, phone turns) and Mac browser tasks can run on your ChatGPT plan instead: see [Model runtimes](#model-runtimes).
 - **Recommended:** Typesafe (small judgment calls), Honcho (memory), Composio (apps), AgentMail (email), Tailscale (direct live view of the bots' screens).
 - **Optional:** AgentPhone plus a public URL for texts and calls (see `edge/`).
 - **For "Your Mac":** the Codex CLI signed in with ChatGPT (with computer use), and `cua-driver` (default `~/.local/bin/cua-driver`). macOS asks for Screen Recording and Accessibility.
@@ -118,11 +118,11 @@ Bops reaches its models through a runtime (`lib/server/runtime/`). `openai` (the
 ```bash
 BOPS_RUNTIME=codex          # every capability
 BOPS_TEXT_RUNTIME=codex     # or one at a time: text (chat, memory, watches, suggested replies, phone turns),
-BOPS_TASK_RUNTIME=openai    # tasks (threads on a computer),
+BOPS_TASK_RUNTIME=codex     # tasks in the bots' Mac browsers (openai for Orgo),
 BOPS_VOICE_RUNTIME=openai   # voice (calls in the app)
 ```
 
-Today `codex` covers text only: tasks and voice still run on OpenAI whatever their setting says (they don't read it yet). On `codex`, text counts against your plan's 5-hour and weekly limits, and when a limit is reached the bot says so and when it's back. The backend it uses (`chatgpt.com/backend-api/codex`) isn't a public API: it can change, and it's for your own use on your own Mac only. `BOPS_CHAT_MODEL` and `BOPS_PHONE_MODEL` pick the models in both runtimes.
+Today `codex` covers text and tasks in bot browsers on host `mac`, without an OpenAI key. Select the Mac browser host for those tasks; Orgo is refused before any computer is created, with a message to use `BOPS_TASK_RUNTIME=openai`. OpenAI tasks retain the Agents API/executor path on Mac and Orgo. Native **Your Mac** tasks use Codex in both runtimes, with the existing app approval cards. Voice still runs on OpenAI. On `codex`, text and tasks count against your plan's 5-hour and weekly limits, and when a limit is reached the bot says so and when it's back. The backend it uses (`chatgpt.com/backend-api/codex`) isn't a public API: it can change, and it's for your own use on your own Mac only. `BOPS_CHAT_MODEL` and `BOPS_PHONE_MODEL` pick text models in both runtimes. Tasks use `BOPS_SESSION_MODEL` (default `gpt-6.1-sol`), or `BOPS_HARD_MODEL` (default `gpt-6-astra`) for high effort. Replies keep the same task thread after completion or a server restart; Stop interrupts the current turn. Task browser tools and coding instructions are isolated from your personal Codex tools/skills. Browser tasks expose an explicit allowlist of browser interactions, excluding host-code execution and file uploads; workspace commands cannot inherit extra writable roots, network access or writable tmp directories from your Codex config. For a separate test instance, `BOPS_CDP_BASE_PORT` changes its bot browser port range (default 9300).
 
 ### Texts and calls (optional)
 
