@@ -28,11 +28,11 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 
 ## Purpose
 
-Clone de `github.com/nickvasilescu/bops` mantido localmente pelo dono para self-hosting num Mac. App Electron (`desktop/`) que carrega o servidor Next.js (`app/`, `lib/server/`) na porta 3210. Visão geral, layout e serviços externos: [README.md](README.md). Convenções de escrita do código: [CONTRIBUTING.md](CONTRIBUTING.md) (seção "How the code is written").
+Fork de `github.com/OrgoAI/bops` mantido pelo dono em `github.com/guilhermexp/bops` para self-hosting num Mac. App Electron (`desktop/`) que carrega o servidor Next.js (`app/`, `lib/server/`) na porta 3210. Visão geral, layout e serviços externos: [README.md](README.md). Convenções de escrita do código: [CONTRIBUTING.md](CONTRIBUTING.md) (seção "How the code is written").
 
 ## Ownership
 
-- `origin` é o upstream; não há permissão de push. Customizações locais ficam commitadas no `main` local e integrações do upstream entram por merge normal.
+- `origin` é o fork do dono (`guilhermexp/bops`); `upstream` é o original (`OrgoAI/bops`), sem permissão de push. Customizações ficam commitadas no `main` e publicadas no fork; integrações do upstream entram por merge normal.
 - Este repo não usa OpenSpec. Escopo e provas de mudanças delegadas ficam no ticket do harness; o "como" fica neste DOX.
 
 ## Local Contracts
