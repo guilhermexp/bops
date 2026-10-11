@@ -32,7 +32,7 @@ Fork de `github.com/OrgoAI/bops` mantido pelo dono em `github.com/guilhermexp/bo
 
 ## Ownership
 
-- `origin` é o fork do dono (`guilhermexp/bops`); `upstream` é o original (`OrgoAI/bops`), sem permissão de push. Customizações ficam commitadas no `main` e publicadas no fork; integrações do upstream entram por merge normal.
+- `origin` é o fork do dono (`guilhermexp/bops`); `upstream` é o original (`OrgoAI/bops`), sem permissão de push. O `main` local acompanha `origin/codex-self-hosted`, branch padrão do fork; publique com `git push origin main:codex-self-hosted`. A `main` remota preserva a versão upstream recebida na criação do fork. Integrações do upstream entram por merge normal, quando autorizadas.
 - Este repo não usa OpenSpec. Escopo e provas de mudanças delegadas ficam no ticket do harness; o "como" fica neste DOX.
 
 ## Local Contracts
