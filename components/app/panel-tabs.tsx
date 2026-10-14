@@ -1,10 +1,13 @@
 "use client";
 
 import { createContext, createElement, useEffect, useRef, useState } from "react";
+import { categoryOf, type CategoryId } from "@/lib/memory-categories";
 import { live, type AppState } from "@/lib/types";
 import type { Section } from "./bot-panel";
+import { CrmFileIcon } from "./crm";
 import { Mascot } from "./mascot";
 import { MacIcon } from "./mac-tab";
+import { CategoryIcon } from "./memory-categories";
 import { KeyIcon } from "./screen-cards";
 import { MonitorIcon, teamOf } from "./ui";
 
@@ -20,7 +23,16 @@ export type PanelTab =
   | { id: string; kind: "web"; url: string; title?: string }
   | { id: string; kind: "new" }
   | { id: string; kind: "vault" }
-  | { id: string; kind: "mac" };
+  | { id: string; kind: "mac" }
+  /** A CRM file (crm.tsx), in the workspace it belongs to. */
+  | { id: string; kind: "crm"; ws: string; file: string }
+  /**
+   * What Bops knows, one category at a time (memory-categories.tsx): one tab per workspace, at the item
+   * asked for (`focus`), or with a search filled in (`query`: Show all, from the sidebar's search; it's
+   * taken off once the page has filled it in). `focusAt` is when they were asked for, so asking again
+   * for the same one shows it again.
+   */
+  | { id: string; kind: "memory"; ws: string; category: CategoryId; focus?: string; focusAt?: number; query?: string };
 
 /** The tab that follows the chat. */
 export const CHAT_TAB = "chat";
@@ -82,11 +94,23 @@ function Tab({ state, tab: t, on, closable, onPick, onClose }: { state: AppState
     (t.kind === "computer" && state.sessions.some((s) => s.botId === t.botId && live(s) && s.runsOn !== "mac")) ||
     (t.kind === "mac" && state.sessions.some((s) => s.runsOn === "mac" && live(s)));
   const needsYou =
-    (t.kind === "computer" &&
-      (state.watches?.some((w) => w.botId === t.botId && w.alert) || state.sessions.some((s) => s.botId === t.botId && live(s) && s.blocker))) ||
-    (t.kind === "mac" && !!state.mac?.approvals.length);
+    t.kind === "computer" && (state.watches?.some((w) => w.botId === t.botId && w.alert) || state.sessions.some((s) => s.botId === t.botId && live(s) && s.blocker));
   const label =
-    t.kind === "computer" ? `${b?.name ?? "Bot"}'s computer` : t.kind === "bot" ? (b?.name ?? "Bot") : t.kind === "web" ? t.title || hostOf(t.url) : t.kind === "vault" ? "Vault" : t.kind === "mac" ? "Your Mac" : "New tab";
+    t.kind === "computer"
+      ? `${b?.name ?? "Bot"}'s computer`
+      : t.kind === "bot"
+        ? (b?.name ?? "Bot")
+        : t.kind === "web"
+          ? t.title || hostOf(t.url)
+          : t.kind === "vault"
+            ? "Vault"
+            : t.kind === "mac"
+              ? "Your Mac"
+              : t.kind === "crm"
+                ? t.file
+                : t.kind === "memory"
+                  ? (categoryOf(t.category)?.label ?? "Memory")
+                  : "New tab";
   return (
     <div
       onClick={onPick}
@@ -104,6 +128,10 @@ function Tab({ state, tab: t, on, closable, onPick, onClose }: { state: AppState
         <KeyIcon />
       ) : t.kind === "mac" ? (
         <MacIcon />
+      ) : t.kind === "crm" ? (
+        <CrmFileIcon />
+      ) : t.kind === "memory" ? (
+        <CategoryIcon id={t.category} />
       ) : (
         <GlobeIcon />
       )}
@@ -153,7 +181,13 @@ export const toAddress = (typed: string) => {
  * across launches); in a plain browser tab it's a frame, which some sites refuse, hence the
  * "Open in browser" button.
  */
-export function WebTab({ url, hidden, onPage }: { url: string; hidden: boolean; onPage: (url: string, title: string) => void }) {
+const webPartition = (user?: string) => (user ? `persist:bops-web-${user.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80)}` : "persist:bops-web");
+
+/**
+ * A web page in a tab. In the Mac app its cookies and storage are the signed-in Orgo user's own
+ * (`user`: a partition each), so another account signed in on this Mac never sees their sign-ins.
+ */
+export function WebTab({ url, hidden, user, onPage }: { url: string; hidden: boolean; user?: string; onPage: (url: string, title: string) => void }) {
   // The tab loads its first address once; navigating inside it doesn't reload it from here.
   const [src, setSrc] = useState(url);
   const [at, setAt] = useState(url);
@@ -238,7 +272,7 @@ export function WebTab({ url, hidden, onPage }: { url: string; hidden: boolean; 
         </button>
       </div>
       {native ? (
-        createElement("webview", { ref: setView, src, partition: "persist:bops-web", allowpopups: "true", className: "min-h-0 flex-1" })
+        createElement("webview", { ref: setView, src, partition: webPartition(user), allowpopups: "true", className: "min-h-0 flex-1" })
       ) : (
         <iframe src={src} className="min-h-0 w-full flex-1 border-0" title={hostOf(src)} />
       )}

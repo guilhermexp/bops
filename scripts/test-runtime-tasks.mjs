@@ -44,6 +44,8 @@ const signIn = () =>
 signIn();
 Object.assign(process.env, {
   BOPS_SELF_HOSTED: "1",
+  BOPS_COMPUTER_TOOL: "0",
+  BOPS_CDP_BASE_PORT: "19730",
   CODEX_HOME: codexHome,
   PATH: `${bin}:${process.env.PATH}`,
   OPENAI_API_KEY: "sk-test-not-a-real-key",
@@ -76,12 +78,15 @@ globalThis.__bopsTestCodex = {
   off: (id) => listeners.delete(id),
   waiting: new Map(),
   sessionApps: new Map(),
+  listenerMap: listeners,
 };
 const emit = (threadId, method, params = {}) => listeners.get(threadId)?.({ method, params: { threadId, ...params } });
 
 const root = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 // A third runtime exists only in this process. Its continuation is deliberately unlike either provider's.
 const fixtureOpens = [];
+let fixtureHandleId = 0;
+const fixtureControl = { openGate: null, openEntered: null, turnGate: null, turnEntered: null, turns: 0, closed: [] };
 globalThis.__bopsFixtureTasks = {
   releaseScreens: true,
   assertHost() {},
@@ -90,20 +95,41 @@ globalThis.__bopsFixtureTasks = {
   snapshot: (thread) => thread.saved,
   open: async (req) => {
     fixtureOpens.push(req.resume);
-    const thread = { id: "fixture_handle", saved: req.resume ?? { cursor: { page: "first", revision: 0 } } };
+    if (fixtureControl.openGate) {
+      fixtureControl.openEntered?.();
+      await fixtureControl.openGate;
+    }
+    const thread = { id: `fixture_handle_${++fixtureHandleId}`, saved: req.resume ?? { cursor: { page: "first", revision: 0 } } };
     req.opened?.(thread);
     return thread;
   },
   turn: async ({ thread, hooks }) => {
+    fixtureControl.turns++;
+    const delayed = !!fixtureControl.turnGate;
+    if (fixtureControl.turnGate) {
+      fixtureControl.turnEntered?.();
+      await fixtureControl.turnGate;
+    }
     thread.saved = { cursor: { page: "next", revision: thread.saved.cursor.revision + 1 } };
-    hooks.saveState?.(thread.saved);
+    if (delayed) {
+      hooks.step("stale-test", "late step");
+      hooks.caption("late caption");
+      hooks.saveState?.(thread.saved);
+    } else hooks.saveState?.(thread.saved);
     return `Fixture revision ${thread.saved.cursor.revision}`;
   },
-  close: async () => {},
+  close: async (thread) => { fixtureControl.closed.push(thread.id); },
 };
+globalThis.__bopsFixtureControl = fixtureControl;
+const executorCalls = [];
+const executorKills = [];
+globalThis.__bopsExecutorCalls = executorCalls;
+globalThis.__bopsExecutorKills = executorKills;
+globalThis.__bopsTaskChildRunning = false;
+globalThis.__enableNativeApps = false;
 const orgoCommands = [];
 globalThis.__bopsOrgoCommands = orgoCommands;
-const STAND_INS = new Set(["codex", "orgo", "relay", "desktop", "mirror", "memory", "decide", "briefing", "screen-watch", "attention", "mail", "phone", "channels", "skills", "plan", "tailnet", "vault"]);
+const STAND_INS = new Set(["codex", "orgo", "relay", "desktop", "mirror", "memory", "decide", "briefing", "screen-watch", "attention", "mail", "phone", "channels", "skills", "plan", "tailnet", "vault", "composio"]);
 registerHooks({
   resolve(specifier, context, next) {
     if (specifier.startsWith("@/")) specifier = pathToFileURL(`${root}/${specifier.slice(2)}`).href;
@@ -132,9 +158,16 @@ registerHooks({
       const source = readFileSync(new URL(url), "utf8").replace('codex: codexTasks }', 'codex: codexTasks, fixture: globalThis.__bopsFixtureTasks }');
       return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source) };
     }
+    if (url.endsWith("/lib/server/user-paths.ts")) {
+      const source = readFileSync(new URL(url), "utf8").replace('join(homedir(), ".bops")', `join(${JSON.stringify(scratch)}, ".bops")`);
+      return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source) };
+    }
     if (url.endsWith("/lib/server/local.ts")) {
-      const source = readFileSync(new URL(url), "utf8").replace('join(homedir(), ".bops")', `join(${JSON.stringify(scratch)}, ".bops")`).replace("export async function ensureChrome(", "async function unusedChrome(");
-      return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source + "\nexport async function ensureChrome() {}") };
+      const source = readFileSync(new URL(url), "utf8").replace('join(homedir(), ".bops")', `join(${JSON.stringify(scratch)}, ".bops")`).replace("export async function ensureChrome(", "async function unusedChrome(")
+        .replaceAll("export function startExecutor(", "function unusedExecutor(")
+        .replace("export async function startExecutor(", "async function unusedExecutor(")
+        .replace("export async function currentUrl(", "async function unusedCurrentUrl(");
+      return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source + "\nexport async function ensureChrome() {}\nexport async function currentUrl() { return \"about:blank\"; }\nexport async function startExecutor(...args) { globalThis.__bopsExecutorCalls.push(args); const running = globalThis.__bopsTaskChildRunning; return { exitCode: running ? null : 0, signalCode: null, kill(signal) { globalThis.__bopsExecutorKills.push({ sessionId: args[0], signal }); }, once() {} }; }") };
     }
     const name = url.match(/\/lib\/server\/([a-z-]+)\.ts$/)?.[1];
     if (!name || !STAND_INS.has(name)) return next(url, context);
@@ -142,11 +175,12 @@ registerHooks({
       return {
         format: "module",
         shortCircuit: true,
-        source: `export const orgo = { screens: async () => [99,100,101,102].map((d) => ({ display: ":" + d })), bash: async (_id, cmd) => { globalThis.__bopsOrgoCommands.push(cmd); return { exit_code: 0, output: "ok" }; } };\nexport class OrgoError extends Error {}\nexport const screenId = () => "";\n`,
+        source: `export const computerAsleepError = () => false; export const computerWakingError = () => false; export const madeByThisServer = () => false; export const madeReady = () => {}; export const wakeWaitMs = () => 1;
+export const orgo = { screens: async () => [99,100,101,102].map((d) => ({ display: ":" + d })), bash: async (_id, cmd) => { globalThis.__bopsOrgoCommands.push(cmd); return { exit_code: 0, output: "ok" }; } };\nexport class OrgoError extends Error {}\nexport const screenId = () => "";\n`,
       };
     const names = [...readFileSync(new URL(url), "utf8").matchAll(/^export (?:async )?(?:function\*? |const |let |class )([A-Za-z_$][\w$]*)/gm)].map((m) => m[1]);
     const source = names
-      .map((n) => (n === "watchScreen" ? "export const watchScreen = () => () => {};" : n === "codex" ? "export const codex = globalThis.__bopsTestCodex;" : n === "emptyMac" ? "export const emptyMac = () => ({ ready: false, approvals: [], alwaysApps: [], rules: [] });" : `export const ${n} = function () { return Promise.resolve(); };`))
+      .map((n) => (n === "watchScreen" ? "export const watchScreen = () => () => {};" : n === "codex" ? "export const codex = globalThis.__bopsTestCodex;" : n === "emptyMac" ? "export const emptyMac = () => ({ ready: false, approvals: [], alwaysApps: [], rules: [] });" : name === "composio" && n === "composioOn" ? "export const composioOn = () => globalThis.__enableNativeApps === true;" : name === "composio" && n === "accountsOf" ? "export const accountsOf = () => globalThis.__enableNativeApps === true ? [{ id: 'fake-account' }] : [];" : name === "composio" && n === "appsKeyFor" ? "export const appsKeyFor = () => 'fake-app-key';" : `export const ${n} = function () { return Promise.resolve(); };`))
       .join("\n");
     return { format: "module", shortCircuit: true, source };
   },
@@ -272,6 +306,35 @@ assert.match(store.session(refused.id)?.error ?? "", /BOPS_TASK_RUNTIME=openai/)
 assert.equal(store.getState().bots[0].computerStatus, "none", "no Orgo computer was provisioned");
 assert.equal(agentBodies.length, 0);
 store.update((s) => { s.host = "mac"; });
+// An explicit Your Mac task always stays on Codex, even with the OpenAI task runtime selected.
+process.env.BOPS_TASK_RUNTIME = "openai";
+globalThis.__enableNativeApps = true;
+const savedMac = store.getState().mac;
+store.update((s) => { s.mac = { ...(s.mac ?? {}), ready: true, reason: undefined }; });
+const nativeThreadStarts = ofBefore("thread/start").length;
+const nativeTurnStarts = ofBefore("turn/start").length;
+const nativeAgentSessions = agentBodies.length;
+const nativeSession = sessions.startSession({ botId: "boppy", goal: "Use Calculator", title: "Native runtime policy", where: "mac", fresh: true });
+for (let i = 0; i < 300 && ofBefore("thread/start").length === nativeThreadStarts && store.session(nativeSession.id)?.status !== "failed"; i++) await new Promise((r) => setTimeout(r, 10));
+const nativeThreadParams = ofBefore("thread/start").at(-1)?.params;
+assert.ok(nativeThreadParams, `explicit Your Mac starts Codex despite BOPS_TASK_RUNTIME=openai (error: ${store.session(nativeSession.id)?.error})`);
+assert.equal(store.session(nativeSession.id)?.taskRuntime, "codex");
+assert.equal(agentBodies.length, nativeAgentSessions, "native Your Mac doesn't create an OpenAI Agents session");
+const appServer = nativeThreadParams.config.mcp_servers.bops_apps;
+assert.equal(appServer.command, process.execPath);
+assert.match(appServer.args[0], /(?:^|\/)vm\/apps-mcp\.mjs$/);
+assert.notEqual(appServer.args[0], process.execPath, "Node receives the apps MCP script exactly once");
+for (let i = 0; i < 100 && ofBefore("turn/start").length === nativeTurnStarts && store.session(nativeSession.id)?.status !== "failed"; i++) await new Promise((r) => setTimeout(r, 10));
+assert.ok(ofBefore("turn/start").length > nativeTurnStarts, `native task reached Codex turn (error: ${store.session(nativeSession.id)?.error})`);
+const nativeThreadId = ofBefore("turn/start").at(-1).params.threadId;
+emit(nativeThreadId, "item/completed", { item: { id: "native-policy-answer", type: "agentMessage", text: "Calculator is ready." } });
+emit(nativeThreadId, "turn/completed", { turn: { id: `turn_${ofBefore("turn/start").length}`, status: "completed" } });
+for (let i = 0; i < 100 && store.session(nativeSession.id)?.status !== "done" && store.session(nativeSession.id)?.status !== "failed"; i++) await new Promise((r) => setTimeout(r, 10));
+assert.equal(store.session(nativeSession.id)?.answer, "Calculator is ready.", `native task completed (status=${store.session(nativeSession.id)?.status}, error=${store.session(nativeSession.id)?.error})`);
+store.update((s) => { s.mac = savedMac; });
+globalThis.__enableNativeApps = false;
+delete process.env.BOPS_TASK_RUNTIME;
+console.log("native selection -> explicit Your Mac stays Codex under OpenAI defaults; apps MCP argv is valid");
 console.log("session lifecycle -> persisted thread resumed, stop saved, Orgo refused before provisioning");
 // The caller must persist and return an arbitrary continuation, including mid-turn updates.
 process.env.BOPS_TASK_RUNTIME = "fixture";
@@ -308,11 +371,79 @@ process.env.OPENAI_API_KEY = "sk-test-not-a-real-key";
 store.patchSession(extra.id, { taskState: undefined, taskRuntime: undefined, agentSessionId: "sess_legacy", env: { id: "env_legacy", remoteUrl: "http://127.0.0.1:9/remote" } });
 sessions.replyToSession(extra.id, "Read the legacy page.");
 for (let i = 0; i < 800 && store.session(extra.id)?.answer !== "OpenAI Example Domain"; i++) await new Promise((r) => setTimeout(r, 10));
-assert.equal(store.session(extra.id)?.answer, "OpenAI Example Domain", "legacy Agents sessions resume under a different configured runtime");
+assert.equal(store.session(extra.id)?.answer, "OpenAI Example Domain", `legacy Agents sessions resume under a different configured runtime; status=${store.session(extra.id)?.status}; error=${store.session(extra.id)?.error}`);
 assert.equal(store.session(extra.id)?.taskRuntime, "openai");
-assert.deepEqual(store.session(extra.id)?.taskState, { id: "sess_legacy", env: { id: "env_legacy", remoteUrl: "http://127.0.0.1:9/remote" } });
+assert.equal(store.session(extra.id)?.taskState?.id, "sess_legacy");
+assert.equal(store.session(extra.id)?.taskState?.env?.id, "env_legacy");
+assert.equal(store.session(extra.id)?.taskState?.env?.remoteUrl, "http://127.0.0.1:9/remote");
+assert.equal(store.session(extra.id)?.taskState?.env?.display, 100, "legacy resume records the same Mac display used by its browser tool");
+assert.equal(store.session(extra.id)?.taskState?.env?.cdpPort, 19730, "legacy resume pins the browser MCP endpoint to its original Chrome");
 assert.equal(agentBodies.length, 0, "legacy Agents continuation does not create a replacement session");
 console.log("extensible tasks -> opaque persisted continuation, pinned reply and Orgo release");
+
+// An account swap while a runtime is opening or turning must not let its late callbacks write into
+// the new account's session, messages, or task state. The old runtime handle still closes.
+process.env.BOPS_TASK_RUNTIME = "fixture";
+const swapStateWithSentinel = (sessionId, label) => {
+  const box = globalThis.__bops2;
+  const next = structuredClone(box.state);
+  const old = next.sessions.find((s) => s.id === sessionId);
+  assert.ok(old, `session ${sessionId} exists before account swap`);
+  next.sessions = next.sessions.map((s) => s.id === sessionId ? {
+    ...s, status: "done", endedAt: Date.now(), answer: `${label} answer`, error: undefined,
+    taskState: { account: label }, steps: [], replies: [], activity: undefined,
+  } : s);
+  next.messages = [{ id: `${label}_message`, at: Date.now(), chatId: old.chatId, role: "system", text: `${label} message` }];
+  box.state = next;
+  box.swaps = (box.swaps ?? 0) + 1;
+  box.version++;
+};
+const waitUntil = async (predicate, message) => {
+  for (let i = 0; i < 300 && !predicate(); i++) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(predicate(), message);
+};
+let releaseOpen;
+let enteredOpenResolve;
+const enteredOpen = new Promise((resolve) => { enteredOpenResolve = resolve; });
+fixtureControl.openGate = new Promise((resolve) => { releaseOpen = resolve; });
+fixtureControl.openEntered = enteredOpenResolve;
+const turnsBeforeOpen = fixtureControl.turns;
+const handleBeforeOpen = fixtureHandleId + 1;
+const staleOpen = sessions.startSession({ botId: "boppy", goal: "Wait during open", where: "cloud", fresh: true });
+await enteredOpen;
+swapStateWithSentinel(staleOpen.id, "open-swap");
+releaseOpen();
+fixtureControl.openGate = null;
+fixtureControl.openEntered = null;
+await waitUntil(() => fixtureControl.closed.includes(`fixture_handle_${handleBeforeOpen}`), "stale open handle closes");
+assert.equal(fixtureControl.turns, turnsBeforeOpen, "a task whose open completed after the swap starts no model turn");
+assert.equal(store.session(staleOpen.id)?.answer, "open-swap answer");
+assert.deepEqual(store.session(staleOpen.id)?.taskState, { account: "open-swap" });
+assert.deepEqual(store.getState().messages.map((m) => m.text), ["open-swap message"]);
+
+store.update((state) => { state.sessions = []; state.messages = []; state.host = "mac"; });
+let releaseTurn;
+let enteredTurnResolve;
+const enteredTurn = new Promise((resolve) => { enteredTurnResolve = resolve; });
+fixtureControl.turnGate = new Promise((resolve) => { releaseTurn = resolve; });
+fixtureControl.turnEntered = enteredTurnResolve;
+const turnsBeforeSwap = fixtureControl.turns;
+const handleBeforeTurn = fixtureHandleId + 1;
+const staleTurn = sessions.startSession({ botId: "boppy", goal: "Wait during turn", where: "cloud", fresh: true });
+await enteredTurn;
+swapStateWithSentinel(staleTurn.id, "turn-swap");
+releaseTurn();
+fixtureControl.turnGate = null;
+fixtureControl.turnEntered = null;
+await waitUntil(() => fixtureControl.closed.includes(`fixture_handle_${handleBeforeTurn}`), "stale turn handle closes");
+assert.equal(fixtureControl.turns, turnsBeforeSwap + 1, "the account swap does not start a replacement task turn");
+assert.equal(store.session(staleTurn.id)?.answer, "turn-swap answer");
+assert.deepEqual(store.session(staleTurn.id)?.taskState, { account: "turn-swap" }, "late saveState is dropped");
+assert.deepEqual(store.session(staleTurn.id)?.steps, [], "late step callback is dropped");
+assert.equal(store.session(staleTurn.id)?.activity, undefined, "late caption callback is dropped");
+assert.deepEqual(store.getState().messages.map((m) => m.text), ["turn-swap message"], "late completion cannot post into the replacement account");
+console.log("account swap -> delayed open/turn callbacks dropped; stale handles closed");
+
 calls.length = 0;
 store.update((s) => { s.sessions = []; s.messages = []; s.usage = []; });
 process.env.OPENAI_API_KEY = "sk-test-not-a-real-key";
@@ -322,7 +453,7 @@ const tasks = await import(`${root}/lib/server/runtime/tasks/index.ts`);
 
 const workspace = local.WORKSPACE;
 const instructions = "You are Boppy, the chief of staff bot in Bops.";
-const macPlace = { host: "mac", cdpPort: 9300, workspace };
+const macPlace = { host: "mac", cdpPort: 9300, workspace, sessionId: "ses_adapter" };
 const orgoPlace = { host: "orgo", computerId: "comp_test", display: 100, sessionId: "ses_test", botId: "boppy", workspace: "/workspace" };
 const macOpen = (extra = {}) => ({ instructions, effort: "medium", place: macPlace, botId: "boppy", ...extra });
 const tick = () => new Promise((r) => setImmediate(r));
@@ -718,7 +849,11 @@ if (reviewRegressions[process.argv[2]]) {
     assert.equal(body.agent.tools.length, 2, "web search and the browser, no screen tools");
     assert.equal(body.agent.tools[1].server_label, "browser");
     assert.equal(body.agent.tools[1].required, true);
-    assert.deepEqual(body.agent.tools[1].transport, local.browserMcp(9300));
+    assert.deepEqual(body.agent.tools[1].transport, local.browserMcp(9300, local.taskDir("ses_adapter")));
+    assert.deepEqual(body.agent.tools[1].allowed_tools, local.MAC_BROWSER_TOOLS, "OpenAI Mac browser keeps the upstream sandbox tool allowlist");
+    assert.equal(executorCalls.at(-1)[0], "ses_adapter");
+    assert.equal(executorCalls.at(-1)[4], local.taskDir("ses_adapter"));
+    assert.equal(executorCalls.at(-1)[5], false, "adapter retains sandbox unless Full access is enabled");
     assert.equal(body.agent.multi_agent, undefined);
     assert.equal(body.environment.type, "self_hosted");
     assert.equal(body.environment.workspace_directory, workspace);
@@ -751,8 +886,65 @@ if (reviewRegressions[process.argv[2]]) {
   } finally {
     await rt.close(cloudThread);
   }
+  // New upstream Orgo sessions use Responses' computer tool, while saved Agents threads stay Agents.
+  process.env.BOPS_COMPUTER_TOOL = "1";
+  const agentsBeforeComputer = agentBodies.length;
+  const computer = await rt.open({ instructions, effort: "medium", place: orgoPlace, botId: "boppy" });
+  try {
+    assert.equal(agentBodies.length, agentsBeforeComputer, "computer runner does not create an Agents session");
+    assert.deepEqual(rt.snapshot(computer), { runner: "computer" });
+    assert.deepEqual(rt.resume({ taskState: rt.snapshot(computer) }), { runner: "computer" });
+    assert.equal(rt.usesComputerTool({ runner: "computer" }, orgoPlace), true);
+    assert.equal(rt.usesComputerTool({ agentSessionId: "legacy", env: { id: "legacy-env", remoteUrl: "http://127.0.0.1:9" } }, orgoPlace), false, "legacy Agents session keeps its runner");
+    assert.equal(rt.usesComputerTool({}, macPlace), false, "Responses computer runner stays on Orgo");
+  } finally {
+    await rt.close(computer);
+    process.env.BOPS_COMPUTER_TOOL = "0";
+  }
   assert.equal(calls.length, before, "openai doesn't start a Codex thread");
   console.log("openai -> Agents session unchanged (mac browser, orgo helpers)");
+}
+
+// A stale OpenAI close still kills its child, but cannot remove the replacement's shared task folder.
+{
+  process.env.BOPS_TASK_RUNTIME = "openai";
+  globalThis.__bopsTaskChildRunning = true;
+  const rt = tasks.tasksRuntime();
+  const ownerPlace = { ...macPlace, sessionId: "ses_owner" };
+  const first = await rt.open(macOpen({ sessionId: "ses_owner", place: ownerPlace }));
+  const second = await rt.open(macOpen({ sessionId: "ses_owner", place: ownerPlace, resume: { id: first.id, env: first.env } }));
+  const folder = local.taskDir("ses_owner");
+  mkdirSync(folder, { recursive: true });
+  writeFileSync(join(folder, "replacement-owner.txt"), "keep");
+  const killedBefore = executorKills.length;
+  await rt.close(first);
+  assert.equal(executorKills.length, killedBefore + 1, "stale close still kills its own executor child");
+  assert.equal(readFileSync(join(folder, "replacement-owner.txt"), "utf8"), "keep", "stale close cannot remove the replacement task folder");
+  await rt.close(second);
+  assert.equal(existsSync(folder), false, "current owner removes its task folder on close");
+  globalThis.__bopsTaskChildRunning = false;
+  console.log("OpenAI lifecycle -> stale close kills its executor, preserves replacement folder");
+}
+
+// Orgo cleanup is owned by the current task for a display; a stale handle must not kill its replacement.
+{
+  process.env.BOPS_TASK_RUNTIME = "openai";
+  const rt = tasks.tasksRuntime();
+  const sessionId = "ses_orgo_owner";
+  const place = { ...orgoPlace, sessionId };
+  const first = await rt.open({ instructions, effort: "medium", place, sessionId, botId: "boppy" });
+  const second = await rt.open({ instructions, effort: "medium", place, sessionId, botId: "boppy" });
+  const beforeClose = orgoCommands.length;
+  await rt.close(first);
+  const staleCleanup = orgoCommands.at(-1) ?? "";
+  assert.equal(orgoCommands.length, beforeClose, "a stale Orgo close must not send cleanup for the replacement's display");
+  assert.doesNotMatch(staleCleanup, /pkill/);
+  await rt.close(second);
+  const ownerCleanup = orgoCommands.at(-1) ?? "";
+  assert.match(ownerCleanup, /if \[ "\$\(cat .*executor-owner-100.*\)" = /, "current owner checks its generation under the display lock");
+  assert.match(ownerCleanup, /pkill -f/);
+  assert.match(ownerCleanup, /rm -f .*executor-key-100/);
+  console.log("Orgo lifecycle -> stale close cannot kill a replacement sharing the display");
 }
 
 // Your Mac shares the adapter while preserving native app approvals.
@@ -784,6 +976,25 @@ if (reviewRegressions[process.argv[2]]) {
   assert.deepEqual(targets[0].apps, ["Calculator"]);
   await rt.close(thread);
   console.log("Your Mac -> native approvals, app targets, answer through the task interface");
+}
+
+// Resuming the same Codex thread claims it before async work; the stale handle cannot off/unsubscribe it.
+{
+  const rt = tasks.macTasksRuntime();
+  const sessionId = "ses_codex_owner";
+  const place = { ...macPlace, sessionId };
+  const first = await rt.open(macOpen({ native: true, sessionId, place }));
+  const second = await rt.open(macOpen({ native: true, sessionId, place, resume: rt.snapshot(first) }));
+  const unsubscribedBefore = of("thread/unsubscribe").length;
+  const listener = () => {};
+  globalThis.__bopsTestCodex.listenerMap.set(first.id, listener);
+  await rt.close(first);
+  assert.equal(globalThis.__bopsTestCodex.listenerMap.get(first.id), listener, "stale close cannot remove the resumed thread's listener");
+  assert.equal(of("thread/unsubscribe").length, unsubscribedBefore, "stale close cannot unload the resumed thread");
+  await rt.close(second);
+  assert.equal(globalThis.__bopsTestCodex.listenerMap.has(second.id), false, "current close removes its listener");
+  assert.equal(of("thread/unsubscribe").length, unsubscribedBefore + 1, "current close unloads its thread");
+  console.log("Codex lifecycle -> resumed-thread ownership protects listeners and unsubscribe");
 }
 
 // Stopping before turn/start responds, including a terminal event before that response.

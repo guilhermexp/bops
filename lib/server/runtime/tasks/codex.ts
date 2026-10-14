@@ -2,7 +2,7 @@ import "server-only";
 import { mkdirSync } from "node:fs";
 import { codex } from "../../codex";
 import { browserServer } from "../../local";
-import { patchSession } from "../../store";
+import { patchSession, stateEpoch } from "../../store";
 import { recordTokens } from "../../usage";
 import { codexAuth, CodexSignInError, type CodexAuth } from "../codex/auth";
 import { CodexLimitError } from "../codex/client";
@@ -10,8 +10,18 @@ import { taskModel, type TaskOpen, type TaskTurn, type TasksRuntime } from "./ty
 
 const TURN_TIMEOUT_MS = 10 * 60_000;
 type CodexState = { id: string; tokens?: { input: number; output: number } };
-type CodexThread = CodexState & { auth: CodexAuth; native?: boolean };
+type CodexThread = CodexState & { auth: CodexAuth; native?: boolean; ownerKey?: string; ownerToken: object };
 type Problem = { message?: string; code?: string | number; codexErrorInfo?: string | Record<string, unknown>; resets_at?: number; resets_in_seconds?: number };
+
+function codexState(value: unknown): value is CodexState {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Partial<CodexState>;
+  return typeof state.id === "string" && (!state.tokens || (typeof state.tokens.input === "number" && typeof state.tokens.output === "number"));
+}
+
+/** Protects app-server listeners and loaded threads when an account swaps during a same-id run. */
+const taskOwners = new Map<string, object>();
+const threadOwners = new Map<string, object>();
 
 function failure(error: Problem, auth: CodexAuth): Error {
   const info = JSON.stringify(error.codexErrorInfo ?? error.code ?? "");
@@ -54,32 +64,83 @@ async function settings(req: TaskOpen) {
 
 export const codexTasks: TasksRuntime = {
   releaseScreens: false,
-  resume(session) { return session.taskState !== undefined ? session.taskState : (session.codexThread ? { id: session.codexThread, tokens: session.taskTokens } : undefined); },
+  resume(session) { return codexState(session.taskState) ? session.taskState : (session.codexThread ? { id: session.codexThread, tokens: session.taskTokens } : undefined); },
   snapshot(thread) { const { id, tokens } = thread as CodexThread; return { id, tokens }; },
   assertHost(host) {
     if (host === "orgo") throw new Error("Codex tasks work on this Mac only. Use BOPS_TASK_RUNTIME=openai for an Orgo computer.");
   },
   async outOfCredit() { return false; },
   async open(req) {
+    const epoch = req.epoch ?? stateEpoch();
     this.assertHost(req.place.host);
+    const sessionId = req.sessionId ?? req.place.sessionId;
+    const ownerToken = {};
+    const previousSessionOwner = sessionId ? taskOwners.get(sessionId) : undefined;
     const resume = req.resume as CodexState | undefined;
-    const auth = await codexAuth();
-    mkdirSync(req.place.workspace, { recursive: true });
-    await codex.ready();
+    const previousThreadOwner = resume ? threadOwners.get(resume.id) : undefined;
+    if (sessionId) taskOwners.set(sessionId, ownerToken);
+    const current = () => epoch === stateEpoch() && (!sessionId || taskOwners.get(sessionId) === ownerToken);
+    if (resume) threadOwners.set(resume.id, ownerToken);
+    if (!resume && req.sessionId && current()) patchSession(req.sessionId, { taskState: undefined, codexThread: undefined, taskTokens: undefined });
+    const restoreSessionOwner = () => {
+      if (!sessionId || taskOwners.get(sessionId) !== ownerToken) return;
+      if (previousSessionOwner) taskOwners.set(sessionId, previousSessionOwner);
+      else taskOwners.delete(sessionId);
+    };
+    const restoreThreadOwner = () => {
+      if (!resume || threadOwners.get(resume.id) !== ownerToken) return;
+      if (previousThreadOwner) threadOwners.set(resume.id, previousThreadOwner);
+      else threadOwners.delete(resume.id);
+    };
+    let auth: CodexAuth;
     try {
+      auth = await codexAuth();
+    } catch (e) {
+      restoreSessionOwner();
+      restoreThreadOwner();
+      throw e;
+    }
+    let openedThreadId: string | undefined;
+    try {
+      if (!current()) throw new Error("The signed-in account changed while the task was opening");
+      mkdirSync(req.place.workspace, { recursive: true });
+      await codex.ready();
+      if (!current()) throw new Error("The signed-in account changed while the task was opening");
+      const config = await settings(req);
+      if (!current()) throw new Error("The signed-in account changed while the task was opening");
       const result = resume
-        ? await codex.request<{ thread: { id: string } }>("thread/resume", { threadId: resume.id, ...await settings(req) })
-        : await codex.request<{ thread: { id: string } }>("thread/start", { ...await settings(req), serviceName: "Bops" });
-      const thread: CodexThread = { id: result.thread.id, auth, native: req.native, tokens: resume ? resume.tokens : { input: 0, output: 0 } };
-      req.opened?.(thread);
+        ? await codex.request<{ thread: { id: string } }>("thread/resume", { threadId: resume.id, ...config })
+        : await codex.request<{ thread: { id: string } }>("thread/start", { ...config, serviceName: "Bops" });
+      openedThreadId = result.thread.id;
+      if (!current()) {
+        const threadOwner = threadOwners.get(result.thread.id);
+        if (!threadOwner || threadOwner === ownerToken) {
+          threadOwners.delete(result.thread.id);
+          await codex.request("thread/unsubscribe", { threadId: result.thread.id }).catch(() => {});
+        }
+        throw new Error("The signed-in account changed while the task was opening");
+      }
+      threadOwners.set(result.thread.id, ownerToken);
+      const thread: CodexThread = { id: result.thread.id, auth, native: req.native, ownerKey: sessionId, ownerToken, tokens: resume ? resume.tokens : { input: 0, output: 0 } };
+      if (current()) req.opened?.(thread);
       return thread;
     } catch (e) {
+      if (openedThreadId && threadOwners.get(openedThreadId) === ownerToken) {
+        threadOwners.delete(openedThreadId);
+        codex.off(openedThreadId);
+        await codex.request("thread/unsubscribe", { threadId: openedThreadId }).catch(() => {});
+      } else restoreThreadOwner();
+      restoreSessionOwner();
       throw failure(e as Problem, auth);
     }
   },
   turn(req) { return turn(req); },
   async close(thread) {
+    const saved = thread as CodexThread;
+    if (threadOwners.get(thread.id) !== saved.ownerToken) return;
     codex.off(thread.id);
+    threadOwners.delete(thread.id);
+    if (saved.ownerKey && taskOwners.get(saved.ownerKey) === saved.ownerToken) taskOwners.delete(saved.ownerKey);
     // Release the loaded thread and its tool processes; resume reloads the saved history/config.
     await codex.request("thread/unsubscribe", { threadId: thread.id }).catch(() => {});
   },
@@ -88,8 +149,10 @@ export const codexTasks: TasksRuntime = {
 function turn({ thread, input, effort, botId, epoch, sessionId, hooks }: TaskTurn): Promise<string> {
   const saved = thread as CodexThread;
   const { auth, native } = saved;
+  const owns = () => threadOwners.get(thread.id) === saved.ownerToken;
+  if (hooks.isStopped() || !owns()) return Promise.reject(new Error("Stopped by you"));
   // The Mac approval router still associates questions through this thread alias.
-  if (native && sessionId) patchSession(sessionId, { codexThread: thread.id });
+  if (native && sessionId && epoch === stateEpoch() && !hooks.isStopped() && owns()) patchSession(sessionId, { codexThread: thread.id });
   return new Promise((resolve, reject) => {
     let last = "";
     let turnId: string | undefined;
@@ -106,7 +169,8 @@ function turn({ thread, input, effort, botId, epoch, sessionId, hooks }: TaskTur
       ended = true;
       clearTimeout(timer);
       clearTimeout(stopTimer);
-      codex.off(thread.id);
+      clearInterval(staleTimer);
+      if (owns()) codex.off(thread.id);
       hooks.turnId?.(undefined);
       if (usage && !countedTotal) recordTokens("session", model, { input_tokens: usage.inputTokens, output_tokens: usage.outputTokens }, botId, epoch);
       if (error) reject(error);
@@ -124,8 +188,15 @@ function turn({ thread, input, effort, botId, epoch, sessionId, hooks }: TaskTur
     };
     const timer = setTimeout(() => { interrupt(); finish(new Error("Codex took too long on this step")); }, TURN_TIMEOUT_MS);
     hooks.bindStop(interrupt);
+    const staleTimer = setInterval(() => {
+      if (hooks.isStopped() || !owns()) finish(new Error("Stopped by you"));
+    }, 250);
     codex.on(thread.id, (m) => {
       if (ended) return;
+      if (hooks.isStopped() || !owns()) {
+        finish(new Error("Stopped by you"));
+        return;
+      }
       const p = m.params as {
         turnId?: string; itemId?: string; delta?: string; willRetry?: boolean; error?: Problem;
         tokenUsage?: { last?: { inputTokens: number; outputTokens: number }; total?: { inputTokens: number; outputTokens: number } };

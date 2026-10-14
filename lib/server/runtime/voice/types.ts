@@ -38,7 +38,7 @@ export type VoiceClient =
 /** The browser's answer: SDP to set as the remote description, and `client` for everything else. */
 export type VoiceAnswer = { sdp: string; sessionId: string; client: VoiceClient };
 
-export type VoiceStart = { sdp: string; instructions: string; voice: string };
+export type VoiceStart = { sdp: string; instructions: string; voice: string; botId: string };
 
 export type VoiceRuntime = {
   chooseVoice(bot: Bot): Promise<string>;

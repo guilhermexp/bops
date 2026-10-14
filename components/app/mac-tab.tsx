@@ -7,8 +7,8 @@ import { Mascot } from "./mascot";
 import { post } from "./ui";
 
 /*
- * The user's Mac, as a place bots work: whether it's ready, what's waiting on their OK, what's running
- * there, which apps bots may always use, and the words that send a task there.
+ * The user's Mac, as a place bots work: Codex approvals and sign-in, what's running there, and the
+ * words that send a task there.
  */
 
 export function MacIcon({ size = 14, color = "currentColor" }: { size?: number; color?: string }) {
@@ -20,14 +20,18 @@ export function MacIcon({ size = 14, color = "currentColor" }: { size?: number; 
   );
 }
 
-/** One of Codex's questions, as a card: "Sam wants to use Calculator on your Mac". */
+/** A Codex approval, with its buttons next to the Mac screen the task is using. */
 export function ApprovalCard({ state, approval: a, compact }: { state: AppState; approval: MacApproval; compact?: boolean }) {
   const [busy, setBusy] = useState(false);
   const b = state.bots.find((x) => x.id === a.botId);
   const s = state.sessions.find((x) => x.id === a.sessionId);
   const decide = async (decision: "once" | "session" | "always" | "deny") => {
     setBusy(true);
-    await post("/api/mac", { id: a.id, decision });
+    try {
+      await post("/api/mac", { id: a.id, decision });
+    } finally {
+      setBusy(false);
+    }
   };
   const who = b?.name ?? "A bot";
   const btn = "rounded-full px-3 py-1.5 text-[12.5px] font-medium leading-4 disabled:opacity-50";
@@ -53,7 +57,6 @@ export function ApprovalCard({ state, approval: a, compact }: { state: AppState;
       <div className="flex flex-wrap gap-1.5">
         {a.kind === "app" ? (
           <>
-            {/* "Once" is a single action, so a task asks again at its next step; for the task is the usual answer. */}
             <button disabled={busy} onClick={() => void decide("session")} className={`${btn} bg-ink text-white`}>
               Allow for this task
             </button>
@@ -82,13 +85,29 @@ export function ApprovalCard({ state, approval: a, compact }: { state: AppState;
   );
 }
 
-/** Your Mac's settings, in a sheet over the Your Mac tab: whether bots can work here, apps they may always use, words that mean the Mac. */
+/** Your Mac's settings, in a sheet over the Your Mac tab: whether bots can work here, and the words that mean the Mac. */
 export function MacSettings({ state }: { state: AppState }) {
   const m = state.mac;
+  const retry = m?.next === "codex" && !m.installing;
   const [rule, setRule] = useState("");
+  const [codexAction, setCodexAction] = useState<"sign-in" | "open" | null>(null);
+  const [codexError, setCodexError] = useState<string | null>(null);
   const section = "flex flex-col gap-2";
   const heading = "text-[15px] font-semibold leading-5";
   const sub = "text-[12.5px] leading-[17px] text-[#6B6B6B]";
+  const runCodex = async (action: "sign-in" | "open") => {
+    setCodexAction(action);
+    setCodexError(null);
+    try {
+      const res = await post("/api/mac/codex", { action });
+      const body = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) throw new Error(body.error || "Couldn't reach Codex on this Mac.");
+    } catch (error) {
+      setCodexError((error as Error).message);
+    } finally {
+      setCodexAction(null);
+    }
+  };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col items-center overflow-y-auto px-6 pb-7 pt-6">
@@ -102,13 +121,35 @@ export function MacSettings({ state }: { state: AppState }) {
             <span className="flex items-center gap-1.5 text-[13px] leading-[19px] text-[#6B6B6B]">
               <span className={`size-2 rounded-full ${m?.ready ? "bg-[#2BB673]" : "bg-[#C9C9C6]"}`} />
               {m?.ready
-                ? `Bots can work here using your ChatGPT plan${m.plan ? ` (${m.plan.replace(/_/g, " ")})` : ""}. You approve each app the first time.`
+                ? m.plan
+                  ? `Bots can work here using your ChatGPT plan${m.plan !== "unknown" ? ` (${m.plan.replace(/_/g, " ")})` : ""}. You approve each app the first time.`
+                  : "Bots can browse here in a Chrome of their own, on your home internet, with Bops AI credit. They can't use your Mac's apps for now."
                 : (m?.reason ?? "Checking…")}
             </span>
           </div>
-          <button onClick={() => void post("/api/mac", { check: true }, "PATCH")} className="shrink-0 rounded-full px-3 py-1.5 text-[12.5px] font-medium shadow-[0_0_0_1px_#E2E2DF] hover:bg-[#F7F7F6]">
-            Check again
+          {/* An install of Codex that failed (it runs bots' tools here) starts again; anything else is looked at again. */}
+          <button
+            onClick={() => void (retry ? post("/api/mac/codex", { action: "install" }) : post("/api/mac", { check: true }, "PATCH"))}
+            className="shrink-0 rounded-full px-3 py-1.5 text-[12.5px] font-medium shadow-[0_0_0_1px_#E2E2DF] hover:bg-[#F7F7F6]"
+          >
+            {retry ? "Try again" : "Check again"}
           </button>
+        </div>
+
+        <div className={section}>
+          <div className="flex flex-col gap-0.5">
+            <span className={heading}>Codex sign-in</span>
+            <span className={sub}>Use your ChatGPT account for Bops runtimes set to Codex, including text, voice and native Mac tasks.</span>
+            {codexError && <span role="alert" className="text-[12px] leading-4 text-[#B42318]">{codexError}</span>}
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            <button disabled={codexAction !== null} onClick={() => void runCodex("sign-in")} className="rounded-full bg-ink px-3 py-1.5 text-[12.5px] font-medium leading-4 text-white disabled:opacity-50">
+              {codexAction === "sign-in" ? "Opening sign-in…" : "Sign in to Codex"}
+            </button>
+            <button disabled={codexAction !== null} onClick={() => void runCodex("open")} className="rounded-full bg-[#F2F2F0] px-3 py-1.5 text-[12.5px] font-medium leading-4 hover:bg-[#EAEAE7] disabled:opacity-50">
+              {codexAction === "open" ? "Opening Codex…" : "Open Codex"}
+            </button>
+          </div>
         </div>
 
         <div className={section}>

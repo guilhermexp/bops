@@ -2,7 +2,7 @@ import "server-only";
 import type { FunctionTool, ResponseCreateParamsNonStreaming, ResponseInput } from "openai/resources/responses/responses";
 import { creditsOut } from "../../cloud";
 import { openaiClient } from "../../openai-client";
-import { recordTokens } from "../../usage";
+import { recordTokens, usageTags } from "../../usage";
 import { modelFor, type TextReply, type TextRequest, type TextRuntime } from "./types";
 
 /**
@@ -15,7 +15,7 @@ const client = openaiClient();
 
 async function ask(req: TextRequest, input: TextRequest["input"] | ResponseInput, previous?: string): Promise<TextReply> {
   const body: ResponseCreateParamsNonStreaming = {
-    model: modelFor(req.role),
+    model: modelFor(req.role, req.model),
     reasoning: { effort: req.effort },
     instructions: req.instructions,
     previous_response_id: previous,
@@ -23,11 +23,15 @@ async function ask(req: TextRequest, input: TextRequest["input"] | ResponseInput
     tools: req.tools as FunctionTool[] | undefined,
     parallel_tool_calls: req.parallelTools,
     max_output_tokens: req.quick?.maxOutputTokens,
-    store: req.quick ? false : undefined,
+    store: req.quick || req.ephemeral ? false : undefined,
     text: req.json ? { format: { type: "json_schema", name: req.json.name, strict: true, schema: req.json.schema } } : undefined,
   };
-  const res = await client.responses.create(body, req.quick ? { maxRetries: 0 } : undefined);
-  recordTokens(req.usage.source, res.model, res.usage, req.usage.botId);
+  const res = await client.responses.create(body, {
+    ...usageTags(req.usage.source, req.usage.botId),
+    ...(req.transport?.timeoutMs ? { timeout: req.transport.timeoutMs } : {}),
+    maxRetries: req.quick ? 0 : req.transport?.maxRetries,
+  });
+  recordTokens(req.usage.source, res.model, res.usage, req.usage.botId, req.usage.epoch);
   return {
     text: res.output_text ?? "",
     calls: res.output.flatMap((o) => (o.type === "function_call" ? [{ call_id: o.call_id, name: o.name, arguments: o.arguments }] : [])),

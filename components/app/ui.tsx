@@ -9,7 +9,7 @@ export { botBezel, botOnInk, botWash, DESKTOP_BG } from "@/lib/look";
 
 /** Every state fetcher on the page, so an action can pull fresh state the moment it lands. */
 const refreshers = new Set<() => Promise<void>>();
-const refreshState = () => Promise.all([...refreshers].map((f) => f()));
+export const refreshState = () => Promise.all([...refreshers].map((f) => f()));
 
 /** Sends an action, then refreshes state before resolving, so the UI never shows the old world. */
 export const post = async (url: string, body: unknown = {}, method = "POST") => {
@@ -166,6 +166,32 @@ export function RoundButton({ label, onClick, children, active }: { label: strin
   );
 }
 
+/**
+ * Something needs the user: a small amber dot with an exclamation mark. On their initials while this Mac
+ * still needs something (setup.tsx), and on Full access's one warning in the People sheet (members.tsx).
+ */
+export function NeedsYouDot({ className = "" }: { className?: string }) {
+  return (
+    <span className={`flex size-4 shrink-0 items-center justify-center rounded-full bg-[#E59A0B] ${className}`}>
+      <svg width="8" height="8" viewBox="0 0 8 8">
+        <path d="M4 1.3v3.1" stroke="#FFFFFF" strokeWidth="1.5" strokeLinecap="round" />
+        <circle cx="4" cy="6.3" r="0.85" fill="#FFFFFF" />
+      </svg>
+    </span>
+  );
+}
+
+/** The round X the Account sheet closes with, for a tab on the right that reads as a page (the Vault, a bot's profile). */
+export function CloseButton({ onClick, className = "" }: { onClick: () => void; className?: string }) {
+  return (
+    <button onClick={onClick} aria-label="Close" className={`flex size-8 shrink-0 items-center justify-center rounded-full shadow-[0_0_0_1px_#E6E6E3] hover:bg-[#F7F7F6] ${className}`}>
+      <svg width="12" height="12" viewBox="0 0 12 12">
+        <path d="M2 2l8 8M10 2l-8 8" fill="none" stroke="#0A0A0A" strokeWidth="1.6" strokeLinecap="round" />
+      </svg>
+    </button>
+  );
+}
+
 
 /** A service's real logo on a white tile (or the logo's own tile), else its letter on its color. */
 export function BrandTile({ item, size }: { item: { name: string; color: string; glyph: string; logo?: Logo }; size: number }) {
@@ -191,3 +217,17 @@ export function BrandTile({ item, size }: { item: { name: string; color: string;
 export const currentWorkspace = (state: AppState) => state.workspace ?? state.workspaces?.[0]?.id ?? MAIN_WORKSPACE;
 export const teamOf = (state: AppState) => state.bots.filter((b) => workspaceOf(b) === currentWorkspace(state));
 export const chatInWorkspace = (state: AppState, c: Chat) => (c.workspaceId ?? workspaceOf(state.bots.find((b) => b.id === c.botIds[0]))) === currentWorkspace(state);
+
+/**
+ * Whether this is a self-hosted install (/api/config): Bops runs every service for you otherwise, so
+ * Settings shows only what's yours to set, and there are no usage events to mention.
+ */
+export function useSelfHosted() {
+  const [selfHosted, setSelfHosted] = useState(false);
+  useEffect(() => {
+    void fetch("/api/config")
+      .then((r) => r.json())
+      .then((c: { selfHosted?: boolean }) => setSelfHosted(!!c.selfHosted));
+  }, []);
+  return selfHosted;
+}

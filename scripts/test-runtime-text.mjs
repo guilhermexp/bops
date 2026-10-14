@@ -61,6 +61,8 @@ registerHooks({
     }
   },
   load(url, context, next) {
+    if (url.endsWith("/lib/server/full-access.ts"))
+      return { format: "module", shortCircuit: true, source: "export const fullAccessOn = () => globalThis.__bopsTestFullAccess === true;" };
     if (url.endsWith("/runtime/config.ts")) {
       const source = readFileSync(new URL(url), "utf8").replace('["openai", "codex"] as const', '["openai", "codex", "fixture"] as const');
       return { format: "module", shortCircuit: true, source: stripTypeScriptTypes(source) };
@@ -98,8 +100,13 @@ globalThis.bopsOrgoKey = null;
 globalThis.bopsOrgoKeyMissAt = Infinity;
 // Nothing in this process leaves this machine.
 const realFetch = globalThis.fetch;
+let localTypesafeBase;
 globalThis.fetch = (input, init) => {
   const url = new URL(typeof input === "string" || input instanceof URL ? String(input) : input.url);
+  if (url.hostname === "api.typesafe.ai") {
+    if (!localTypesafeBase) throw new Error(`no fake Typesafe endpoint is ready for ${url}`);
+    return realFetch(new URL(`${url.pathname}${url.search}`, localTypesafeBase), init);
+  }
   if (url.hostname !== "127.0.0.1") throw new Error(`not a fake: ${url}`);
   return realFetch(input, init);
 };
@@ -181,6 +188,9 @@ const revoked = new Set();
 /** Every request to the fake OpenAI, and what it answers next. */
 const openaiAsked = [];
 let openaiAnswer = () => ({ text: "Hi from OpenAI." });
+/** What chooseWhere sent to the fake Typesafe decision endpoint. */
+const whereAsked = [];
+let whereDecision = "mac";
 
 const itemsOf = (r) => [
   ...(r.reasoning ? [{ id: "rs_1", type: "reasoning", summary: [], encrypted_content: r.reasoning }] : []),
@@ -191,6 +201,10 @@ const fake = createServer(async (req, res) => {
   const chunks = [];
   for await (const c of req) chunks.push(c);
   const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+  if (req.method === "POST" && req.url === "/v1/systemone") {
+    whereAsked.push(body);
+    return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ model: "jev-test", usage: { input_tokens: 12 }, answers: { where: { type: "choice", choice: whereDecision, confidence: 0.9, probabilities: { mac: 0.9 } } } }));
+  }
   if (req.method === "POST" && req.url === "/codex/responses") {
     const token = (req.headers.authorization ?? "").replace(/^Bearer /, "");
     codexAsked.push({ headers: req.headers, body, token });
@@ -226,6 +240,7 @@ const fake = createServer(async (req, res) => {
 });
 await new Promise((r) => fake.listen(0, "127.0.0.1", r));
 const base = `http://127.0.0.1:${fake.address().port}`;
+localTypesafeBase = base;
 process.env.BOPS_CODEX_BASE_URL = `${base}/codex`;
 process.env.OPENAI_BASE_URL = `${base}/v1`;
 
@@ -235,6 +250,7 @@ const config = await import(`${root}/lib/server/runtime/config.ts`);
 const text = await import(`${root}/lib/server/runtime/text/index.ts`);
 const chat = await import(`${root}/lib/server/chat.ts`);
 const sessions = await import(`${root}/lib/server/sessions.ts`);
+const where = await import(`${root}/lib/server/where.ts`);
 
 // Codex's renewal (account/read with refreshToken): Codex writes the new sign-in, as it does for real.
 const renewals = [];
@@ -284,6 +300,59 @@ while (config.RUNTIMES.includes(unknownRuntimeId)) unknownRuntimeId += "_";
   console.log("selection -> openai by default, per capability over BOPS_RUNTIME, unknown ids refused");
 }
 
+/* ---------------- Native Mac routing stays independent of OpenAI Full Access ---------------- */
+
+{
+  const prior = {
+    host: S.getState().host,
+    mac: S.getState().mac ? structuredClone(S.getState().mac) : undefined,
+    runsOn: main.runsOn,
+  };
+  process.env.TYPESAFE_API_KEY = "test-typesafe-key";
+  process.env.BOPS_TASK_RUNTIME = "openai";
+  globalThis.__bopsTestFullAccess = false;
+  S.update((s) => {
+    s.host = "mac";
+    s.mac = { ready: true, approvals: [], alwaysApps: ["Finder", "Notes"], rules: [] };
+    delete s.bots.find((b) => b.id === main.id).runsOn;
+  });
+  const goal = "Find a place for the team dinner next week";
+  assert.equal(await where.chooseWhere(main.id, goal), "mac");
+  const off = whereAsked.at(-1);
+  assert.deepEqual(off.state.owners_mac.apps_bots_may_always_use, ["Finder", "Notes"], "Jev gets the apps already approved for native Mac use");
+  assert.match(off.questions.where.instructions, /native Codex/i, "the Mac route is the private native runtime");
+  assert.match(off.questions.where.instructions, /approval/i, "the model knows native app use follows approvals");
+  assert.doesNotMatch(off.questions.where.instructions, /Full access|full access/i, "OpenAI browser Full Access does not gate the native route");
+  assert.equal(S.getState().usage.filter((u) => u.source === "decide").at(-1)?.botId, main.id, "the decision remains attributed to the bot");
+
+  globalThis.__bopsTestFullAccess = true;
+  assert.equal(await where.chooseWhere(main.id, goal), "mac");
+  const on = whereAsked.at(-1);
+  assert.deepEqual(on.state.owners_mac.apps_bots_may_always_use, ["Finder", "Notes"]);
+  assert.equal(on.questions.where.instructions, off.questions.where.instructions, "Full Access does not change native Codex routing guidance");
+  assert.equal(where.asksForMac("don't do this on my Mac"), false, "a negated Mac request stays negated");
+  assert.equal(where.asksForMac("please do this on my Mac"), true, "an affirmative Mac request stays explicit");
+
+  const beforeOutside = whereAsked.length;
+  S.update((s) => { s.bots.find((b) => b.id === main.id).runsOn = "mac"; });
+  assert.equal(await where.chooseWhere(main.id, goal, "auto", { outside: true }), "ask", "outside work on a Mac-pinned bot still asks the owner");
+  assert.equal(await where.chooseWhere(main.id, goal, "cloud", { outside: true }), "cloud", "an outside cloud request stays in the cloud");
+  assert.equal(whereAsked.length, beforeOutside, "outside guard bypasses Jev");
+
+  S.update((s) => {
+    s.host = prior.host;
+    if (prior.mac) s.mac = prior.mac;
+    else delete s.mac;
+    const b = s.bots.find((x) => x.id === main.id);
+    if (prior.runsOn === undefined) delete b.runsOn;
+    else b.runsOn = prior.runsOn;
+  });
+  delete process.env.TYPESAFE_API_KEY;
+  delete process.env.BOPS_TASK_RUNTIME;
+  globalThis.__bopsTestFullAccess = false;
+  console.log("where -> native Codex/approved apps independent of Full Access; outside and bot attribution preserved");
+}
+
 /* ---------------- A text-only fixture runtime responds and names the capabilities it lacks ---------------- */
 
 {
@@ -320,6 +389,13 @@ while (config.RUNTIMES.includes(unknownRuntimeId)) unknownRuntimeId += "_";
 signIn();
 {
   codexAnswer = () => ({ text: "Hi Alex, it's your plan talking.", reasoning: "enc-a" });
+  globalThis.__bopsTestFullAccess = false;
+  const priorHost = S.getState().host;
+  const priorMac = S.getState().mac ? structuredClone(S.getState().mac) : undefined;
+  S.update((s) => {
+    s.host = "mac";
+    s.mac = { ready: true, approvals: [], alwaysApps: [], rules: [] };
+  });
   assert.equal(await send("Hi there"), "Hi Alex, it's your plan talking.");
   const { headers, body, token } = codexAsked.at(-1);
   assert.equal(token, JSON.parse(readFileSync(authPath, "utf8")).tokens.access_token, "the sign-in in auth.json");
@@ -336,9 +412,35 @@ signIn();
   assert.equal(body.model, "gpt-6.1-sol");
   assert.deepEqual(body.reasoning, { effort: "low" });
   assert.ok(body.tools.some((t) => t.name === "schedule"), "the chat's tools");
-  assert.deepEqual(body.input.at(-1), { role: "user", content: "Hi there" });
+  assert.match(body.instructions, /where cloud uses the bot's isolated Chrome profile on that Mac/i, "cloud tasks use the configured Mac host's separate browser");
+  assert.match(body.instructions, /server is hosted on Alex's Mac, so where "cloud"/i);
+  assert.match(body.instructions, /where "mac".*native Codex.*approval/i, "Your Mac tasks use native Codex and its app approvals");
+  assert.doesNotMatch(body.instructions, /can't use the apps on their Mac.*for now/i, "Full Access off does not hide native Mac apps behind the OpenAI browser setting");
+  assert.doesNotMatch(body.instructions, /Bots can't use the Mac's own apps.*unless the user turns on Full access/i, "the upstream Mac guidance does not override the native approval route");
+  assert.match(body.instructions, /Full Access affects only OpenAI browser tasks on a Mac-hosted server/i);
+  assert.match(body.instructions, /For OpenAI browser tasks on this Mac, Full Access is off/i);
+  assert.match(body.instructions, /Codex text, task, and call work uses the ChatGPT plan/i);
+  assert.doesNotMatch(body.instructions, /It runs on Bops AI credit, like all bot work/i);
+  const startTask = body.tools.find((t) => t.name === "start_task");
+  assert.ok(startTask);
+  assert.match(startTask.parameters.properties.where.description, /isolated Chrome profile/i);
+  assert.match(startTask.parameters.properties.where.description, /native Codex.*approval/i);
+  assert.match(startTask.parameters.properties.then_on_mac.description, /native Mac app/i);
+  const schedule = body.tools.find((t) => t.name === "schedule");
+  assert.match(schedule.parameters.properties.where.description, /native Codex.*approval/i);
+  assert.ok(body.input.some((i) => i.role === "user" && i.content === "Hi there"), "the user's message reaches Codex");
+  assert.ok(body.input.some((i) => i.role === "developer" && String(i.content).includes("As of now")), "the upstream state context reaches Codex as developer guidance");
   assert.equal(openaiAsked.length, 0, "nothing to OpenAI");
   assert.equal(tokensOf("chat").at(-1).inputTokens, 30, "tokens counted as before");
+  globalThis.__bopsTestFullAccess = true;
+  assert.equal(await send("One more thing"), "Hi Alex, it's your plan talking.");
+  assert.match(codexAsked.at(-1).body.instructions, /For OpenAI browser tasks on this Mac, Full Access is on/i);
+  globalThis.__bopsTestFullAccess = false;
+  S.update((s) => {
+    s.host = priorHost;
+    if (priorMac) s.mac = priorMac;
+    else delete s.mac;
+  });
   console.log("codex body -> store:false, stream:true, no previous_response_id or max_output_tokens");
 }
 
@@ -514,6 +616,39 @@ signIn();
   assert.equal(codexAsked.length, from, "nothing to the Codex backend");
   delete process.env.OPENAI_API_KEY;
   console.log("openai -> previous_response_id tool loop, nothing to Codex");
+}
+
+/* ---------------- A response can't add token usage to a replaced account's state ---------------- */
+
+{
+  process.env.BOPS_TEXT_RUNTIME = "codex";
+  const before = tokensOf("chat").length;
+  const staleEpoch = S.stateEpoch() - 1;
+  codexAnswer = () => ({ text: "Late answer from the previous account." });
+  await text.generateText({
+    role: "chat",
+    effort: "low",
+    instructions: "Answer.",
+    input: "Hi",
+    usage: { source: "chat", epoch: staleEpoch },
+  });
+  assert.equal(tokensOf("chat").length, before, "a response from a replaced state isn't charged to the current account");
+
+  process.env.BOPS_TEXT_RUNTIME = "openai";
+  process.env.OPENAI_API_KEY = "sk-test-not-a-real-key";
+  const beforeOpenAI = tokensOf("chat").length;
+  openaiAnswer = () => ({ text: "Late answer from the previous account." });
+  await text.generateText({
+    role: "chat",
+    effort: "low",
+    instructions: "Answer.",
+    input: "Hi",
+    usage: { source: "chat", epoch: staleEpoch },
+  });
+  assert.equal(tokensOf("chat").length, beforeOpenAI, "an OpenAI response from a replaced state is not charged either");
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.BOPS_TEXT_RUNTIME;
+  console.log("usage epoch -> stale Codex and OpenAI responses aren't counted in the current state");
 }
 
 /* ---------------- Bops Cloud's AI credit counts only when text goes through the cloud ---------------- */

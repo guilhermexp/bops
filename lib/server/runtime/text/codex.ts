@@ -9,10 +9,11 @@ import { modelFor, type TextReply, type TextRequest, type TextRuntime } from "./
  * there (store: false), so a tool loop sends the whole conversation again: what was asked, every item
  * answered (reasoning comes back encrypted, to be sent again as is), and the tools' outputs. Items are
  * sent without their ids, which only point at stored items. There's no cap on an answer's length.
+ * `transport` keeps the OpenAI SDK's timeout/retry settings; Codex uses its own five-minute timeout and one 401 renewal.
  */
 
 async function ask(req: TextRequest, input: unknown[], session: string): Promise<TextReply> {
-  const model = modelFor(req.role);
+  const model = modelFor(req.role, req.model);
   const answer = await codexResponses(
     {
       model,
@@ -28,7 +29,7 @@ async function ask(req: TextRequest, input: unknown[], session: string): Promise
     },
     session,
   );
-  recordTokens(req.usage.source, answer.model ?? model, answer.usage, req.usage.botId);
+  recordTokens(req.usage.source, answer.model ?? model, answer.usage, req.usage.botId, req.usage.epoch);
   const said = answer.items.filter((i) => i.type === "message").flatMap((i) => (i.content as { type: string; text?: string }[] | undefined) ?? []);
   const sent = answer.items.map((item) => Object.fromEntries(Object.entries(item).filter(([k]) => k !== "id")));
   return {

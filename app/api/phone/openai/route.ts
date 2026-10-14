@@ -3,6 +3,7 @@ import { CLOUD_CALLER_HEADER } from "@/cloud/protocol";
 import { fromCloudTunnel } from "@/lib/server/cloud-tunnel";
 import { openaiClient } from "@/lib/server/openai-client";
 import { incomingCall, logWebhook, verdictOf } from "@/lib/server/phone";
+import { notReady } from "@/lib/server/ready";
 
 export const dynamic = "force-dynamic";
 
@@ -23,6 +24,8 @@ type WebhookEvent = Awaited<ReturnType<typeof client.webhooks.unwrap>>;
 
 export async function POST(request: Request) {
   try { requireSipVoice(); } catch (e) { return Response.json({ error: (e as Error).message }, { status: 409 }); }
+  const unready = notReady();
+  if (unready) return unready;
   const body = await request.text();
   let event: WebhookEvent;
   const tunnel = fromCloudTunnel(request);

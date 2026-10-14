@@ -18,7 +18,7 @@ function voiceRuntime(id: RuntimeId): VoiceRuntime {
 export async function answerVoice(bot: Bot, sdp: string, instructions: string) {
   const runtime = voiceRuntime(runtimeFor("voice"));
   const voice = await runtime.chooseVoice(bot);
-  return runtime.answer({ sdp, instructions, voice });
+  return runtime.answer({ sdp, instructions, voice, botId: bot.id });
 }
 
 // Calls retain their runtime when settings change during a conversation.

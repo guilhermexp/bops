@@ -1,5 +1,6 @@
 import { closeVoice, sayVoice, voiceEvents } from "@/lib/server/runtime/voice/index";
 import { delegate, endCall, startCall } from "@/lib/server/call";
+import { notReady } from "@/lib/server/ready";
 
 /**
  * Calls with a bot, only from the app on this Mac, on the selected voice runtime:
@@ -8,6 +9,8 @@ import { delegate, endCall, startCall } from "@/lib/server/call";
  * - { action: "end", botId, seconds } → notes the call in the chat
  */
 export async function POST(request: Request) {
+  const unready = notReady();
+  if (unready) return unready;
   if (!["localhost", "127.0.0.1", "::1"].includes(new URL(request.url).hostname)) return Response.json({ error: "local only" }, { status: 403 });
   const body = (await request.json()) as { action: string; botId: string; callId?: string; content?: string; delegationId?: string; complete?: boolean; sdp?: string; request?: string; seconds?: number; transcript?: { who: string; text: string }[] };
   try {

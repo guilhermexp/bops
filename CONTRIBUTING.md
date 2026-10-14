@@ -5,25 +5,28 @@ Thanks for helping. A few things keep this smooth.
 ## Before you start
 
 - For anything bigger than a small fix, open an issue first so we can agree on the approach.
-- Security problems: [report them privately](https://github.com/nickvasilescu/bops/security/advisories/new), not in issues (see [SECURITY.md](SECURITY.md)).
+- Security problems go to security@orgo.ai, not issues (see [SECURITY.md](SECURITY.md)).
 - Be kind: we follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Contributor License Agreement
 
-Bops is released under FSL-1.1-ALv2, and Organic Intelligence, Inc. also runs a hosted version. Before we merge your first pull request, we'll ask you to sign our CLA. You keep the copyright to your work.
+Bops is released under FSL-1.1-ALv2, and Organic Intelligence, Inc. also runs a hosted version, so to accept your contribution we need you to sign our Contributor License Agreement (CLA). We'll ask you to before we merge your first pull request. You keep the copyright to your work.
 
 ## Development
 
 ```bash
-npm install
-cp .env.example .env.local   # at least OPENAI_API_KEY and ORGO_API_KEY
+npm run setup                # dependencies, .env.local from .env.example, and a git hook
 npm run app                  # or: npx next dev --port 3210
 ```
+
+Fill in `.env.local` as the README's "Run it yourself" says, or set `BOPS_SELF_HOSTED=0` and sign in with Orgo. Work on a branch of your fork (or, on Orgo's team, a `dev/<name>` branch here) and open a pull request against `main`: `main` takes changes only through pull requests, and CI (typecheck, lint and a secret scan) has to pass.
 
 Before you open a pull request:
 
 ```bash
+npx next typegen                         # route types (next-env.d.ts isn't committed)
 npx tsc --noEmit -p .
+npx tsc -p cloud/tsconfig.json --noEmit  # Bops Cloud
 npm run lint
 ```
 

@@ -38,8 +38,10 @@ Fork de `github.com/OrgoAI/bops` mantido pelo dono em `github.com/guilhermexp/bo
 ## Local Contracts
 
 - Self-hosting: `BOPS_SELF_HOSTED=1` em `.env.local`. Nesse modo o app não pede login Orgo (`authStatus` em `lib/server/orgo-sign-in.ts`); serviços são chamados diretamente com as chaves de `.env.local`.
-- Estado do app: `.data/state.json` relativo ao `cwd` do servidor (`lib/server/persist.ts`). Perfis Chrome e workspace dos bots: `~/.bops/` (`lib/server/local.ts`). Segredos: Keychain, item "Bops Vault" (`lib/server/keychain.ts`).
+- Estado self-hosted sem conta Orgo: `.data/state.json` relativo ao `cwd` do servidor (`lib/server/persist.ts`); com conta, `.data/users/<id>/state.json`. O upstream v0.0.28 guarda o modo hospedado em Bops Cloud e isola perfis/arquivos por usuário (`user-paths.ts`); o modo self-hosted continua local. Perfis Chrome e workspace dos bots: `~/.bops/` (`lib/server/local.ts`). Segredos: Keychain, item "Bops Vault" (`lib/server/keychain.ts`).
 - Modelos: por runtime (`lib/server/runtime/`, [AGENTS.md](lib/server/runtime/AGENTS.md)). `BOPS_RUNTIME` / `BOPS_<TEXT|TASK|VOICE>_RUNTIME`, ids `openai` (default, upstream) e `codex` (assinatura ChatGPT via login do Codex; `~/.codex/auth.json` só lido, nunca escrito). Chamadores de texto usam só `generateText` de `lib/server/runtime/text/index`. A instância do dono usa `BOPS_RUNTIME=codex`.
+- Integração v0.0.28: `codex-cli.ts` é descoberta/instalação do binário compartilhado; não substitui `codex.ts` (app-server, login, renovação e aprovações). `mac.ts` seleciona a verificação de prontidão pelo runtime de tarefas; o adapter OpenAI mantém o executor upstream. Tarefas no navegador do bot usam o runtime selecionado; o modo nativo **Your Mac** continua sempre Codex, inclusive quando `BOPS_TASK_RUNTIME=openai`. A UI e as rotas `/api/mac` e `/api/mac/codex` preservam aprovações/login Codex junto das guardas upstream de estado e Full access. Build não inicia a verificação do Mac.
+- Respostas assíncronas e notificações de tarefas preservam o epoch/estado de origem; resultados tardios após troca de conta não escrevem no novo estado.
 - Nunca colocar chaves, telefones, e-mails ou dados pessoais em código, prompts, exemplos ou testes.
 
 ## Work Guidance
@@ -59,6 +61,15 @@ node --conditions=react-server scripts/test-phone-voice.mjs
 node --conditions=react-server scripts/test-runtime-text.mjs
 node --conditions=react-server scripts/test-runtime-tasks.mjs
 node --conditions=react-server scripts/test-runtime-voice.mjs
+# Regressões da integração v0.0.28:
+node --conditions=react-server scripts/test-sign-in.mjs
+node --conditions=react-server scripts/test-codex-controls.mjs
+node --conditions=react-server scripts/test-codex-state.mjs
+node --conditions=react-server scripts/test-proxy.mjs
+node --conditions=react-server scripts/test-memory-categories.mjs
+node --conditions=react-server scripts/test-mac-tasks.mjs
+node --conditions=react-server scripts/test-computer-task.mjs
+node --conditions=react-server scripts/test-result-state.mjs
 ```
 
 Test Coverage Matrix:
@@ -66,10 +77,15 @@ Test Coverage Matrix:
 | Camada / path | Tier | Como rodar |
 |---|---|---|
 | `lib/server/phone-voice.ts`, `app/api/phone/agentphone` | integração com OpenAI/backend Codex/AgentPhone falsos (runtimes openai e codex) | `node --conditions=react-server scripts/test-phone-voice.mjs` |
-| `lib/server/runtime/text/**`, `lib/server/runtime/codex/**`, chamadores de texto (`chat.ts`, `memory.ts`, `watches.ts`, `sessions.ts` `suggestReplies`), `lib/server/codex.ts` (app-server sobe na config do usuário) | integração com backend Codex/OpenAI falsos, `CODEX_HOME` temporário; Codex CLI real sem rede; runtime extra de teste responde texto e recusa capacidades ausentes | `node --conditions=react-server scripts/test-runtime-text.mjs` |
+| `lib/server/runtime/text/**`, `lib/server/runtime/codex/**`, chamadores de texto (`chat.ts`, `memory.ts`, `watches.ts`, `sessions.ts` `suggestReplies`), `lib/server/codex.ts` (app-server sobe na config do usuário), `where.ts` (roteamento nativo/alwaysApps/guardas externas) | integração com backend Codex/OpenAI falsos, `CODEX_HOME` temporário; Codex CLI real sem rede; runtime extra de teste responde texto e recusa capacidades ausentes; decisão nativa independe de Full access e preserva apps aprovados | `node --conditions=react-server scripts/test-runtime-text.mjs` |
 | `lib/server/runtime/tasks/**`, `sessions.ts` (tarefas) | integração com singleton app-server e Agents API falsos, workspace/estado temporários; inclui ciclo da sessão/chat e regressões de allowlist MCP, sandbox herdado, limite estruturado e narração nativa, estado opaco de runtime extra, pinning e leitura de legado | `node --conditions=react-server scripts/test-runtime-tasks.mjs` |
 | `lib/server/runtime/voice/**`, `lib/server/call.ts`, `/api/call`, CallBar, guarda SIP | integração com sinalização/sideband/texto falsos em localhost; chamada real isolada com WAV; escolha de voz pertencente a runtime extra de teste | `node --conditions=react-server scripts/test-runtime-voice.mjs` · roteiro de verificação real |
+| resultado de tarefas em `phone.ts`, `channels.ts`, `mail.ts` | envios falsos suspensos durante troca de conta; callbacks antigos não escrevem no novo estado, falhas e sucesso do estado atual continuam reportados | `node --conditions=react-server scripts/test-result-state.mjs` |
 | `lib/server/**` demais | typecheck + lint | `npx tsc --noEmit -p .` · `npm run lint` |
+| self-hosted, controles Codex e guardas HTTP | handlers reais com dependências falsas; sem rede/Keychain | `scripts/test-sign-in.mjs`, `scripts/test-codex-controls.mjs`, `scripts/test-codex-state.mjs`, `scripts/test-proxy.mjs` (Node com `--conditions=react-server`) |
+| navegador OpenAI no host Mac, executor e Full access | fakes localhost e sandbox real, estado/workspace temporários; migração cloud→Your Mac usa app-server Codex falso e preserva proveniência; política nativa também coberta em runtime-tasks | `node --conditions=react-server scripts/test-mac-tasks.mjs` |
+| computer tool OpenAI/Orgo | fakes de Cloud/OpenAI/Orgo e xdotool; ações, segurança, steering e retomada | `node --conditions=react-server scripts/test-computer-task.mjs` |
+| classificação de memória | contrato upstream do sorter, fakes sem rede; runtime Codex também coberto em runtime-text | `node --conditions=react-server scripts/test-memory-categories.mjs` |
 | fluxo do app | e2e real | roteiro abaixo |
 
 Roteiro de verificação real (lido por `to-execute`):

@@ -4,6 +4,7 @@ import { ABOUT_BOPS, SPEAKING } from "./style";
 import { appsNote, placesNote } from "./skills";
 import { answerVoice } from "./runtime/voice/index";
 export { voiceFor, rememberVoices } from "./runtime/voice/index";
+import { dataNote } from "./treg";
 import { botChatId, live, type Bot } from "@/lib/types";
 import { handleMessage } from "./chat";
 import { callEnded, callStarted } from "./attention";
@@ -40,6 +41,7 @@ export async function voicePrompt(b: Bot, how: "live" | "turns" = "live") {
     contactLine(b, true),
     // What it can use (through its delegate) and where else the user reaches it.
     appsNote(b, "call"),
+    dataNote(b, "call"),
     placesNote(b, "call"),
     how === "live"
       ? `You can't act on your own during the call. Whenever ${owner} asks for something to be done, looked up, checked, scheduled, or handed to another bot, delegate it, then tell them briefly what's happening while it runs. When the result comes back, say it in your own words.`
@@ -81,7 +83,7 @@ export async function startCall(botId: string, sdp: string) {
 export async function delegate(botId: string, request: string) {
   const chatId = botChatId(botId);
   const since = Date.now();
-  await handleMessage(chatId, request);
+  await handleMessage(chatId, request, undefined, undefined, undefined, undefined, undefined, true);
   const replies = getState().messages.filter((m) => m.chatId === chatId && m.at >= since && m.role !== "user");
   const threads = getState().sessions.filter((s) => s.chatId === chatId && s.createdAt >= since);
   const said = replies.map((m) => m.text).join(" ").trim();

@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { WebSocketServer } from "ws";
 
-for (const k of ["BOPS_DATABASE_URL", "AGENTMAIL_API_KEY", "HONCHO_API_KEY", "COMPOSIO_API_KEY", "TYPESAFE_API_KEY", "ORGO_API_KEY", "OPENAI_API_KEY", "OPENAI_WEBHOOK_SECRET", "BOPS_RUNTIME", "BOPS_TEXT_RUNTIME", "BOPS_TASK_RUNTIME", "BOPS_VOICE_RUNTIME", "BOPS_CHAT_MODEL", "BOPS_SAM_MODEL", "BOPS_PHONE_MODEL", "AGENTPHONE_API_KEY", "BOPS_CODEX_CLIENT_VERSION", "BOPS_VOICE_SIDEBAND_BASE"])
+for (const k of ["BOPS_DATABASE_URL", "AGENTMAIL_API_KEY", "HONCHO_API_KEY", "COMPOSIO_API_KEY", "TYPESAFE_API_KEY", "ORGO_API_KEY", "OPENAI_API_KEY", "OPENAI_WEBHOOK_SECRET", "BOPS_RUNTIME", "BOPS_TEXT_RUNTIME", "BOPS_TASK_RUNTIME", "BOPS_VOICE_RUNTIME", "BOPS_CHAT_MODEL", "BOPS_SAM_MODEL", "BOPS_PHONE_MODEL", "AGENTPHONE_API_KEY", "BOPS_CODEX_CLIENT_VERSION", "BOPS_VOICE_SIDEBAND_BASE", "BOPS_CLOUD_URL"])
   delete process.env[k];
 
 const scratch = mkdtempSync(join(tmpdir(), "bops-test-runtime-voice-"));
@@ -115,7 +115,7 @@ const fake = createServer(async (req, res) => {
     for (const event of [{ type: "response.output_item.done", item: output }, { type: "response.completed", response: { model: body.model, usage: { input_tokens: 20, output_tokens: 8 } } }]) res.write(`data: ${JSON.stringify(event)}\n\n`);
     return void res.end();
   }
-  if (req.method === "POST" && url.pathname === "/v1/live/sessions") {
+  if (req.method === "POST" && url.pathname.endsWith("/v1/live/sessions")) {
     livePosts.push({ body: JSON.parse(raw || "{}"), headers: req.headers });
     return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(liveAnswer()));
   }
@@ -193,6 +193,7 @@ const token = signIn();
   const voice = await import(`${root}/lib/server/runtime/voice/index.ts`);
   await voice.answerVoice(boppy, OFFER, "fixture test");
   assert.equal(fixtureVoiceInput.voice, "fixture-voice", "the selected runtime chooses the voice it sends to its provider");
+  assert.equal(fixtureVoiceInput.botId, boppy.id, "the selected runtime receives the bot id for cloud usage accounting");
   delete process.env.BOPS_VOICE_RUNTIME;
   console.log("fixture voice -> answer uses the runtime's own voice choice");
 }
@@ -472,6 +473,9 @@ if (focusedLifecycle) {
 {
   process.env.BOPS_VOICE_RUNTIME = "openai";
   process.env.OPENAI_API_KEY = "sk-test-not-a-real-key";
+  process.env.BOPS_SELF_HOSTED = "0";
+  process.env.BOPS_CLOUD_URL = base;
+  globalThis.bopsOrgoKey = "orgo-test-not-a-real-key";
   signalingAnswer = () => ({ status: 201, sdp: ANSWER, callId: "rtc_should_not" });
   const from = signaling.length;
   const res = await post({ action: "start", botId: boppy.id, sdp: OFFER });
@@ -482,6 +486,8 @@ if (focusedLifecycle) {
   const body = livePosts[0].body;
   assert.equal(body.session.model, "gpt-live-1");
   assert.equal(body.session.audio.output.voice, "cedar");
+  assert.equal(livePosts[0].headers["x-bops-source"], "call", "Bops Cloud can count live calls as call usage");
+  assert.equal(livePosts[0].headers["x-bops-bot"], boppy.id, "Bops Cloud receives the called bot id");
   assert.deepEqual(body.session.delegation, { type: "client" });
   assert.equal(body.transport.type, "webrtc");
   assert.equal(body.transport.sdp, OFFER);
@@ -503,6 +509,10 @@ if (focusedLifecycle) {
   const { channelMessage } = await import(`${root}/lib/server/runtime/voice/channel.ts`);
   assert.deepEqual(channelMessage(json.client, { type: "session.commentary.append", delegation_id: "del_openai", content: "Reminder scheduled.", complete: true }), { type: "session.commentary.append", delegation_id: "del_openai", content: "Reminder scheduled." }, "the OpenAI commentary wire has no Codex completion hint");
   assert.deepEqual(channelMessage(json.client, { type: "session.close" }), { type: "session.close" });
+  globalThis.bopsOrgoKey = null;
+  globalThis.bopsOrgoKeyMissAt = Infinity;
+  process.env.BOPS_SELF_HOSTED = "1";
+  delete process.env.BOPS_CLOUD_URL;
   console.log("openai voice -> gpt-live-1, data channel, cedar; commentary and close unchanged");
 }
 

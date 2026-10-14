@@ -3,11 +3,16 @@
 import { useEffect, useRef, useState } from "react";
 import { DISPLAYS, live, workspaceOf, type AppState, type Chat, type Session, type Watch } from "@/lib/types";
 import { initialsOf, signOutOfOrgo } from "./account";
+import { categoriesOpen } from "@/lib/memory-categories";
 import { KeyIcon } from "./screen-cards";
+import { MembersButton } from "./members";
 import { Mascot } from "./mascot";
+import { MemorySections, type MemoryOpen } from "./memory-categories";
+import { RestartConfirm, RestartIcon, useCanRestart } from "./restart";
 import { useSetupNeedsYou } from "./setup";
+import { UpdateNotice } from "./update-notice";
 import { WATCH, WatchEye, watchName } from "./watch-overlay";
-import { ago, ChatAvatar, chatInWorkspace, chatName, currentWorkspace, needsYou, post, RoundButton, StatusIcon, teamOf, useNow } from "./ui";
+import { ago, ChatAvatar, chatInWorkspace, chatName, currentWorkspace, needsYou, NeedsYouDot, post, RoundButton, StatusIcon, teamOf, useNow } from "./ui";
 
 /**
  * The sidebar for one workspace (switch at the top). The list: one row per conversation (Sam pinned, then by latest activity), each with its
@@ -25,7 +30,9 @@ export function Sidebar({
   onAccount,
   onSetup,
   onVault,
+  onMembers,
   onOpenWatch,
+  onOpenMemory,
 }: {
   state: AppState;
   chatId: string;
@@ -37,8 +44,12 @@ export function Sidebar({
   /** The setup screen: what this Mac gives Bops (setup.tsx). */
   onSetup: () => void;
   onVault: () => void;
+  /** The People sheet: who can see the bots' computers on Orgo (members.tsx). */
+  onMembers: () => void;
   /** Show a watched screen or Mac window. */
   onOpenWatch: (watch: Watch) => void;
+  /** Open a category of what Bops knows on the right, at one of its items (memory-categories.tsx). */
+  onOpenMemory: (open: MemoryOpen) => void;
 }) {
   const [query, setQuery] = useState<string | null>(null);
   const q = query?.trim().toLowerCase();
@@ -79,7 +90,7 @@ export function Sidebar({
             onKeyDown={(e) => e.key === "Escape" && setQuery(null)}
             // Clicking away from an empty search closes it (not when the click is on the search button, which toggles it).
             onBlur={(e) => !query.trim() && e.relatedTarget?.getAttribute("aria-label") !== "Search" && setQuery(null)}
-            placeholder="Search bots, chats, threads"
+            placeholder={categoriesOpen(state) ? "Search bots, chats, threads, people" : "Search bots, chats, threads"}
             className="mr-2 h-[34px] min-w-0 flex-1 rounded-full bg-white px-3.5 text-[13px] shadow-[0_0_0_1px_#E6E6E3] outline-none placeholder:text-[#9A9A98]"
           />
         )}
@@ -125,8 +136,18 @@ export function Sidebar({
         )}
       </div>
 
+      {/* What Bops knows, pinned under the chats: Orbit, categories that fill themselves from memory, each a page on the right. Half the sidebar at most, scrolling on its own. Every signed-in account (lib/memory-categories.ts). */}
+      {categoriesOpen(state) && (
+        <div className="-mx-2.5 max-h-[50%] shrink-0 overflow-y-auto border-t border-[#ECECEA] px-2.5 empty:hidden">
+          <MemorySections state={state} query={query ?? ""} onOpen={onOpenMemory} />
+        </div>
+      )}
+
+      {/* A newer Bops on bops.bot (the Mac app checks; Bops doesn't update itself). */}
+      <UpdateNotice />
       <div className="flex items-center gap-2.5 p-1 pt-3">
         <YouMenu state={state} onAccount={onAccount} onSettings={onSettings} onSetup={onSetup} />
+        <MembersButton state={state} onClick={onMembers} />
         <button
           onClick={onCompose}
           className="flex h-10 flex-1 items-center justify-center rounded-full bg-white text-[14px] font-medium shadow-[0_0_0_1px_#E6E6E3] hover:bg-[#FCFCFB]"
@@ -146,32 +167,23 @@ export function Sidebar({
   );
 }
 
-/** Something on this Mac still needs you (setup.tsx): a small amber dot with an exclamation mark. */
-function NeedsYouDot({ className = "" }: { className?: string }) {
-  return (
-    <span className={`flex size-4 shrink-0 items-center justify-center rounded-full bg-[#E59A0B] ${className}`}>
-      <svg width="8" height="8" viewBox="0 0 8 8">
-        <path d="M4 1.3v3.1" stroke="#FFFFFF" strokeWidth="1.5" strokeLinecap="round" />
-        <circle cx="4" cy="6.3" r="0.85" fill="#FFFFFF" />
-      </svg>
-    </span>
-  );
-}
-
 /**
  * You, at the bottom of the sidebar: your initials, and a menu with your Orgo account (plan and
- * usage), Settings, this Mac's permissions, and signing out. While something on this Mac still needs
- * you (and you haven't skipped it on the setup screen), a badge on your initials opens that screen
- * and the menu item carries the same mark.
+ * usage), Settings, this Mac's permissions, Restart Bops (in the Mac app; restart.tsx) and signing
+ * out. While something on this Mac still needs you (and you haven't skipped it on the setup screen),
+ * a badge on your initials opens that screen and the menu item carries the same mark.
  */
 function YouMenu({ state, onAccount, onSettings, onSetup }: { state: AppState; onAccount: () => void; onSettings: () => void; onSetup: () => void }) {
   const [open, setOpen] = useState(false);
+  const [restart, setRestart] = useState(false);
+  const canRestart = useCanRestart();
   const needsYou = useSetupNeedsYou(state);
   const box = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open) return;
     const away = (e: MouseEvent) => !box.current?.contains(e.target as Node) && setOpen(false);
-    const esc = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    // Esc closes the menu, and only the menu (preventDefault keeps the Vault or a profile on the right open).
+    const esc = (e: KeyboardEvent) => e.key === "Escape" && (e.preventDefault(), setOpen(false));
     document.addEventListener("mousedown", away);
     document.addEventListener("keydown", esc);
     return () => {
@@ -238,6 +250,12 @@ function YouMenu({ state, onAccount, onSettings, onSetup }: { state: AppState; o
             <span className="flex-1">Permissions on this Mac</span>
             {needsYou && <NeedsYouDot />}
           </button>
+          {canRestart && (
+            <button onClick={pick(() => setRestart(true))} className={item}>
+              <RestartIcon />
+              Restart Bops
+            </button>
+          )}
           {user && (
             <>
               <div className="mx-2 my-1 h-px bg-[#ECECEA]" />
@@ -249,6 +267,7 @@ function YouMenu({ state, onAccount, onSettings, onSetup }: { state: AppState; o
           )}
         </div>
       )}
+      {restart && <RestartConfirm onClose={() => setRestart(false)} />}
     </div>
   );
 }
@@ -263,7 +282,7 @@ function MainBot({ chat: c, state, selected, onClick, last }: { chat: Chat; stat
   const mine = new Set(teamOf(state).map((x) => x.id));
   const sessions = state.sessions.filter((s) => mine.has(s.botId));
   const working = new Set(sessions.filter((s) => live(s) && !s.askWhere).map((s) => s.botId)).size;
-  const waiting = sessions.filter((s) => needsYou(s)).length + (state.mac?.approvals.length ?? 0) + (state.watches?.filter((w) => w.alert && mine.has(w.botId)).length ?? 0);
+  const waiting = sessions.filter((s) => needsYou(s)).length + (state.watches?.filter((w) => w.alert && mine.has(w.botId)).length ?? 0);
   // One line: what needs you, else who's working, else just the role.
   const status = c.typing.length ? "typing…" : waiting ? `${waiting} need${waiting === 1 ? "s" : ""} you` : working ? `${working} working` : "Chief of Staff";
   return (
@@ -339,6 +358,13 @@ export function DeleteX({ label, onDelete, className = "" }: { label: string; on
       aria-label={label}
       title={label}
       onClick={(e) => {
+        e.stopPropagation();
+        onDelete();
+      }}
+      // It's a button to the keyboard too: Enter or Space.
+      onKeyDown={(e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.preventDefault();
         e.stopPropagation();
         onDelete();
       }}
@@ -524,7 +550,8 @@ function Watching({ state, onOpen }: { state: AppState; onOpen: (w: Watch) => vo
   );
 }
 
-function NameInput({ value, placeholder, onChange, onSave, onCancel }: { value: string; placeholder?: string; onChange: (v: string) => void; onSave: () => void; onCancel: () => void }) {
+/** A name typed in place (a workspace, a CRM file): Enter saves, Esc cancels. With a placeholder, it makes a new one. */
+export function NameInput({ value, placeholder, onChange, onSave, onCancel }: { value: string; placeholder?: string; onChange: (v: string) => void; onSave: () => void; onCancel: () => void }) {
   return (
     <form
       onSubmit={(e) => {

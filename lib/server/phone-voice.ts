@@ -6,7 +6,7 @@ import { delegate, voicePrompt } from "./call";
 import { saveToMemory, wsOf } from "./memory";
 import { generateText, type TextTool } from "./runtime/text/index";
 import { callLog, fromOwner, isOwner, linkClaimed, routeFor, type ApEvent } from "./phone";
-import { addMessage, bot, getState, ownerLine, ownerName, patchSession } from "./store";
+import { addMessage, bot, getState, ownerLine, ownerName, patchSession, stateEpoch } from "./store";
 import { SPEAKING } from "./style";
 import { recordCallMinutes } from "./usage";
 
@@ -63,6 +63,8 @@ type PhoneCall = {
   message?: { name?: string; text: string; callback?: string };
   timer?: ReturnType<typeof setTimeout>;
   ended?: boolean;
+  /** The state it came in on (store.ts stateEpoch): after a sign-out or another account's sign-in, nothing of it lands in the new one. */
+  epoch: number;
 };
 
 const g = globalThis as unknown as { bopsPhoneCalls?: Map<string, PhoneCall> };
@@ -162,7 +164,7 @@ async function respond(b: Bot, c: PhoneCall, instructions: string, tools: TextTo
     ? c.turns.map((t) => ({ role: t.who === "caller" ? ("user" as const) : ("assistant" as const), content: t.text }))
     : [{ role: "user" as const, content: "(The call just connected; the caller hasn't said anything yet. Say hello.)" }];
   // A quick model, thinking lightly (BOPS_PHONE_MODEL, else the chat's).
-  const r = await generateText({ role: "phone", effort: "low", instructions, input, tools, parallelTools: false, quick: { maxOutputTokens: 1200 }, usage: { source: "call", botId: b.id } });
+  const r = await generateText({ role: "phone", effort: "low", instructions, input, tools, parallelTools: false, quick: { maxOutputTokens: 1200 }, usage: { source: "call", botId: b.id, epoch: c.epoch } });
   const called = r.calls.map((o) => {
     try {
       return { name: o.name, args: JSON.parse(o.arguments || "{}") as Record<string, unknown> };
@@ -252,7 +254,7 @@ export async function voiceTurn(e: ApEvent, verdict?: CallerVerdict): Promise<Vo
   if (verdict?.claimed) linkClaimed(from, verdict.claimed, b);
   let c = calls.get(id);
   if (!c) {
-    c = { id, botId: b.id, from, to, owner, startedAt: Date.now(), lastAt: Date.now(), turns: [], work: [] };
+    c = { id, botId: b.id, from, to, owner, startedAt: Date.now(), lastAt: Date.now(), turns: [], work: [], epoch: stateEpoch() };
     calls.set(id, c);
     if (owner) callStarted(b.id);
     callLog({ event: "call", call: id, bot: b.id, from, owner });
@@ -324,6 +326,11 @@ function finish(c: PhoneCall) {
   c.ended = true;
   clearTimeout(c.timer);
   calls.delete(c.id);
+  // Signed out, or another account in, since the call began: its minutes and transcript were the last account's, not this one's.
+  if (c.epoch !== stateEpoch()) {
+    if (c.owner) callEnded();
+    return;
+  }
   const b = bot(c.botId);
   const seconds = Math.max(0, Math.round((c.lastAt - c.startedAt) / 1000));
   recordCallMinutes(c.botId, seconds);

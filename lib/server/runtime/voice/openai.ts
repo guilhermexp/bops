@@ -1,6 +1,7 @@
 import "server-only";
 import { noteOutOfCredit, OUT_OF_CREDIT } from "../../cloud";
 import { openaiClient } from "../../openai-client";
+import { usageTags } from "../../usage";
 import type { Bot } from "@/lib/types";
 import { voiceFor } from "./voices";
 import type { VoiceClient, VoiceRuntime } from "./types";
@@ -29,12 +30,12 @@ export const openaiVoice: VoiceRuntime = {
   chooseVoice(bot: Bot) {
     return voiceFor(bot);
   },
-  async answer({ sdp, instructions, voice }) {
+  async answer({ sdp, instructions, voice, botId }) {
     try {
       const result = await client.live.create({
         session: { model: "gpt-live-1", instructions, audio: { output: { voice } }, delegation: { type: "client" } },
         transport: { type: "webrtc", sdp },
-      } as never);
+      } as never, usageTags("call", botId));
       const live = result as unknown as { session: { id: string }; transport: { sdp: string } };
       return { sdp: live.transport.sdp, sessionId: live.session.id, client: PAGE };
     } catch (e) {

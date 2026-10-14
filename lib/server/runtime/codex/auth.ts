@@ -78,8 +78,7 @@ export async function codexAuth(stale?: string): Promise<CodexAuth> {
 }
 
 async function renew(was: string): Promise<CodexAuth> {
-  // Not a static import: codex.ts imports codexHome from here and checks the Mac as it loads, so a
-  // static import both ways would run that check before codexHome exists.
+  // Load the transport only for renewal; it imports codexHome from here too.
   const { codex } = await import("../../codex");
   try {
     await codex.ready();

@@ -8,7 +8,7 @@ import type { UsageEvent } from "@/lib/types";
 
 export type TextPart = { type: "input_text"; text: string } | { type: "input_image"; image_url: string; detail: "auto" };
 /** A message in the conversation: the user's (or another bot's, or a note from Bops) or this bot's own. */
-export type TextMessage = { role: "user" | "assistant"; content: string | TextPart[] };
+export type TextMessage = { role: "developer" | "user" | "assistant"; content: string | TextPart[] };
 /** A function the model can call. */
 export type TextTool = { type: "function"; name: string; description?: string; strict?: boolean; parameters: Record<string, unknown> };
 export type ToolCall = { call_id: string; name: string; arguments: string };
@@ -20,6 +20,8 @@ export type ModelRole = "chat" | "phone";
 export type TextRequest = {
   role: ModelRole;
   effort: "low" | "medium" | "high";
+  /** A one-request model choice; otherwise the role's BOPS_*_MODEL setting applies. */
+  model?: string;
   instructions: string;
   input: string | TextMessage[];
   tools?: TextTool[];
@@ -29,8 +31,17 @@ export type TextRequest = {
   json?: { name: string; schema: Record<string, unknown> };
   /** A turn someone is waiting on (a phone call): no retries, a cap on the answer's length, and nothing kept by the provider where it can choose. */
   quick?: { maxOutputTokens: number };
+  /** Keep this request out of provider storage when that is a choice. */
+  ephemeral?: boolean;
+  /** Bounded transport options. OpenAI applies these to its SDK request; Codex keeps its fixed timeout and one 401 renewal. */
+  transport?: { timeoutMs?: number; maxRetries?: number };
   /** Whose tokens these are, for the usage ledger (usage.ts). */
-  usage: { source: NonNullable<UsageEvent["source"]>; botId?: string };
+  usage: {
+    source: NonNullable<UsageEvent["source"]>;
+    botId?: string;
+    /** State epoch captured when the work began, so late results aren't charged after an account swap. */
+    epoch?: number;
+  };
 };
 
 export type TextReply = {
@@ -51,7 +62,9 @@ export type TextRuntime = {
 const DEFAULT_MODEL = "gpt-6.1-sol";
 
 /** The model for a role, the same in every runtime: BOPS_CHAT_MODEL for chat (and the small calls), BOPS_PHONE_MODEL (else the chat's) for calls. */
-export function modelFor(role: ModelRole) {
+export function modelFor(role: ModelRole, override?: string) {
+  const chosen = override?.trim();
+  if (chosen) return chosen;
   const chat = process.env.BOPS_CHAT_MODEL?.trim() || process.env.BOPS_SAM_MODEL?.trim();
   return (role === "phone" ? process.env.BOPS_PHONE_MODEL?.trim() || chat : chat) || DEFAULT_MODEL;
 }

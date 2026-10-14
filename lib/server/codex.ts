@@ -9,7 +9,7 @@ import { lowRisk, TALKING_APPS } from "./judgment";
 import { agentEnv } from "./local";
 import { onPostgres } from "./persist";
 import { codexHome } from "./runtime/codex/auth";
-import { addMessage, bot, getState, id, ownerName, update } from "./store";
+import { addMessage, bot, getState, id, ownerName, sameState, stateReady, update } from "./store";
 
 /**
  * The user's Mac, through Codex. Bops drives a local `codex app-server` (OpenAI's documented protocol
@@ -178,6 +178,7 @@ class Codex {
 
   /** Codex is asking something: answer what the user already decided, or put it in front of them. */
   private async ask(m: Rpc) {
+    const stillHere = sameState();
     const threadId = m.params?.threadId;
     const session = threadId ? getState().sessions.find((s) => s.codexThread === threadId) : undefined;
     // Bops' own app tools already ask the user, with the details, so Codex needn't ask again.
@@ -185,13 +186,15 @@ class Codex {
     if (m.method === "mcpServer/elicitation/request") {
       const message = String(m.params?.message ?? "Codex is asking to continue");
       const app = /use "([^"]+)"/.exec(message)?.[1];
-      const always = app && getState().mac?.alwaysApps.some((a) => a.toLowerCase() === app.toLowerCase());
+      const always = app && getState().mac?.alwaysApps?.some((a) => a.toLowerCase() === app.toLowerCase());
       const forSession = app && threadId && this.sessionApps.get(threadId)?.has(app.toLowerCase());
       if (always || forSession) return this.respond(m.id!, { action: "accept", content: {} });
       // Low-stakes for this task (looking at Calculator, Notes, a setting): allowed without asking,
       // just this once, and said so in the chat. Apps where using them at all can mean talking to
       // someone (Messages, Mail, Slack…) always ask: on the Mac an app is allowed as a whole.
-      if (app && session && !TALKING_APPS.test(app) && (await lowRisk(`Use the ${app} app on ${ownerName()}'s Mac`, `task: ${session.goal.slice(0, 500)}`))) {
+      const safe = app && session && !TALKING_APPS.test(app) && (await lowRisk(`Use the ${app} app on ${ownerName()}'s Mac`, `task: ${session.goal.slice(0, 500)}`));
+      if (!stillHere() || (session && !getState().sessions.some((s) => s.id === session.id && s.codexThread === threadId))) return this.respond(m.id!, { action: "decline", content: null });
+      if (safe) {
         addMessage({ chatId: session.chatId, role: "system", text: `${bot(session.botId)?.name ?? "A bot"} used ${app} on your Mac · low risk for this task, so didn't ask`, sessionIds: [session.id] });
         return this.respond(m.id!, { action: "accept", content: {} });
       }
@@ -218,7 +221,7 @@ class Codex {
     if (this.login?.id && p.loginId && p.loginId !== this.login.id) return;
     this.login = undefined;
     this.loginError = p.success ? undefined : "Codex sign-in didn't finish. Try again.";
-    void checkMac().catch(() => {});
+    void refreshMac().catch(() => {});
   }
 
   /** A question got its answer somewhere else (computer use's own prompt on the Mac): drop its card. */
@@ -227,7 +230,7 @@ class Codex {
     for (const [approvalId, w] of this.waiting)
       if (String(w.rpcId) === String(requestId)) {
         this.waiting.delete(approvalId);
-        update((state) => state.mac && (state.mac.approvals = state.mac.approvals.filter((x) => x.id !== approvalId)));
+        update((state) => state.mac && (state.mac.approvals = (state.mac.approvals ?? []).filter((x) => x.id !== approvalId)));
       }
   }
 
@@ -236,14 +239,14 @@ class Codex {
     this.waiting.set(approval.id, { rpcId: m.id!, method: m.method!, threadId: m.params?.threadId });
     update((state) => {
       state.mac ??= emptyMac();
-      state.mac.approvals.push(approval);
+      (state.mac.approvals ??= []).push(approval);
     });
     // Unanswered for ten minutes: no.
     setTimeout(() => this.waiting.has(approval.id) && answer(approval.id, "deny"), 10 * 60_000);
   }
 }
 
-const g = globalThis as typeof globalThis & { __bopsCodex?: Codex; __bopsMacCheck?: ReturnType<typeof setInterval> };
+const g = globalThis as typeof globalThis & { __bopsCodex?: Codex };
 export const codex = (g.__bopsCodex ??= new Codex());
 
 export const emptyMac = (): MacState => ({ ready: false, approvals: [], alwaysApps: [], rules: [...DEFAULT_MAC_RULES] });
@@ -251,9 +254,9 @@ export const emptyMac = (): MacState => ({ ready: false, approvals: [], alwaysAp
 /** The user's answer to one of Codex's questions. "always" also remembers the app for every future task. */
 export function answer(approvalId: string, decision: "once" | "session" | "always" | "deny") {
   const w = codex.waiting.get(approvalId);
-  const a = getState().mac?.approvals.find((x) => x.id === approvalId);
+  const a = getState().mac?.approvals?.find((x) => x.id === approvalId);
   codex.waiting.delete(approvalId);
-  update((state) => state.mac && (state.mac.approvals = state.mac.approvals.filter((x) => x.id !== approvalId)));
+  update((state) => state.mac && (state.mac.approvals = (state.mac.approvals ?? []).filter((x) => x.id !== approvalId)));
   if (!w) return;
   const yes = decision !== "deny";
   if (yes && a?.app && decision === "session" && w.threadId) {
@@ -264,7 +267,7 @@ export function answer(approvalId: string, decision: "once" | "session" | "alway
   if (yes && a?.app && decision === "always")
     update((state) => {
       state.mac ??= emptyMac();
-      if (!state.mac.alwaysApps.some((x) => x.toLowerCase() === a.app!.toLowerCase())) state.mac.alwaysApps.push(a.app!);
+      if (!(state.mac.alwaysApps ??= []).some((x) => x.toLowerCase() === a.app!.toLowerCase())) state.mac.alwaysApps.push(a.app!);
     });
   if (w.method === "mcpServer/elicitation/request") codex.respond(w.rpcId, yes ? { action: "accept", content: {} } : { action: "decline", content: null });
   else codex.respond(w.rpcId, { decision: !yes ? "decline" : decision === "once" ? "accept" : "acceptForSession" });
@@ -280,17 +283,19 @@ const onTheMac = () => process.platform === "darwin" && !onPostgres();
  * a sign-in ends, and while the setup card waits on the user; the answer lives in state.mac.
  */
 export async function checkMac() {
+  if (process.env.NEXT_PHASE === "phase-production-build" || !stateReady()) return false;
+  const stillHere = sameState();
   const has = (p: string) => existsSync(p);
   let ready = false;
   let reason: string | undefined;
   let next: MacState["next"];
   let plan: string | undefined;
   const bin = findCodex();
-  if (!bin && !onTheMac()) {
+  if (!onTheMac()) {
     next = "elsewhere";
     reason = "Computer use works in the Bops app on your Mac.";
   } else if (!bin) {
-    if (!installStatus()) installCodex(() => void checkMac().catch(() => {}));
+    if (!installStatus()) installCodex(() => void refreshMac().catch(() => {}));
     const failed = installStatus()?.state === "failed" ? installStatus()?.error : undefined;
     next = "codex";
     reason = failed !== undefined ? `Couldn't install Codex. ${failed}` : "Installing Codex";
@@ -301,6 +306,7 @@ export async function checkMac() {
     try {
       await codex.ready();
       const acct = await codex.request<{ account?: { type?: string; planType?: string } | null }>("account/read", {}, 15_000);
+      if (!stillHere()) return false;
       if (codex.login && codex.login.until < Date.now()) codex.login = undefined;
       if (acct.account?.type !== "chatgpt") {
         next = "sign-in";
@@ -316,6 +322,7 @@ export async function checkMac() {
       reason = `Codex didn't start (${(e as Error).message.replace(/\.$/, "")}).`;
     }
   }
+  if (!stillHere()) return false;
   const now = { ready, reason, next, installing: next === "codex" && installStatus()?.state === "installing", signingIn: !!codex.login, plan };
   // The setup card looks every few seconds while it waits on the user: only a change goes out to the app.
   const was = getState().mac;
@@ -329,8 +336,8 @@ export async function checkMac() {
 
 /** Retry: install the CLI again if it's still missing (a failed install isn't retried by itself), then look again. */
 export async function retryCodex() {
-  if (!findCodex() && onTheMac()) installCodex(() => void checkMac().catch(() => {}));
-  await checkMac();
+  if (!findCodex() && onTheMac()) installCodex(() => void refreshMac().catch(() => {}));
+  await refreshMac();
 }
 
 /**
@@ -347,7 +354,7 @@ export async function signInToCodex() {
   codex.login = { id: r.loginId, until: Date.now() + 15 * 60_000 };
   codex.loginError = undefined;
   await new Promise<void>((res, rej) => execFile("/usr/bin/open", [r.authUrl!], (e) => (e ? rej(new Error("Couldn't open the sign-in page.")) : res())));
-  await checkMac();
+  await refreshMac();
 }
 
 /**
@@ -362,5 +369,6 @@ export function openCodexApp() {
   child.unref();
 }
 
-g.__bopsMacCheck ??= setInterval(() => void checkMac().catch(() => {}), 5 * 60_000);
-void checkMac().catch(() => {});
+const refreshMac = async () => (await import("./mac")).checkMac();
+
+// mac.ts owns the readiness timer; importing this transport must not overwrite its selected runtime.

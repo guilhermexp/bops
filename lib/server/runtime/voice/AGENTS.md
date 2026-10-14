@@ -10,7 +10,7 @@ Voice runtime, `../../call.ts`, `../../phone.ts` (SIP guard), app call route, Op
 
 ## Local Contracts
 
-- `types.ts`: normalized caption/delegation events, SDP answer and public transport description. Each `VoiceRuntime` implements `chooseVoice(bot)` as well as signaling/control/events; `index.ts` delegates voice choice to the selected runtime. No credentials in any browser response. Each call retains its selected runtime even if environment settings change.
+- `types.ts`: normalized caption/delegation events, SDP answer and public transport description. `VoiceStart` includes the bot id so OpenAI requests through Bops Cloud carry the call's usage tags. Each `VoiceRuntime` implements `chooseVoice(bot)` as well as signaling/control/events; `index.ts` delegates voice choice to the selected runtime. No credentials in any browser response. Each call retains its selected runtime even if environment settings change.
 - OpenAI keeps the `gpt-live-1` request, API/cloud client, stored voice and `oai-events` channel. The renderer still sends greeting, commentary and close over its channel.
 - Codex signals `{BOPS_CODEX_BASE_URL}/realtime/calls?intent=quicksilver&architecture=avas` with `gpt-live-1-codex`, using `codexAuth` (read-only login, app-server renewal after one 401). Headers identify Codex Desktop, an explicit owner decision. `BOPS_CODEX_CLIENT_VERSION` defaults to `0.161.0` (the CLI version used for verification).
 - Authenticated sideband stays on the server: `wss://api.openai.com/v1/live/<rtc_id>`. `BOPS_VOICE_SIDEBAND_BASE` overrides this for localhost tests. No attestation is synthesized: connection without it was observed in the real backend on this machine.
